@@ -1,0 +1,3 @@
+[submodule "modal-agents"]
+	path = modal-agents
+	url = https://github.com/modal-labs/openai-agents-python-example.git
