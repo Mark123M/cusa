@@ -162,6 +162,47 @@ def test_batched_actions_execute_in_order_and_are_logged(tmp_path):
     assert [item["status"] for item in actions] == ["completed", "completed"]
 
 
+def test_actions_jsonl_inserts_blank_lines_between_turns(tmp_path):
+    commands = []
+    client = FakeClient(
+        [
+            {
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_1",
+                        "actions": [{"type": "click", "x": 1, "y": 2}],
+                    },
+                ],
+            },
+            {
+                "id": "resp_2",
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_2",
+                        "actions": [{"type": "click", "x": 3, "y": 4}],
+                    },
+                ],
+            },
+            final_response(),
+        ],
+    )
+
+    _, recorder = run_computer_use_task(
+        client=client,
+        prompt="Click twice across turns.",
+        vm=make_vm(commands),
+        output_root=tmp_path,
+    )
+
+    raw_lines = recorder.actions_path.read_text(encoding="utf-8").splitlines()
+    assert raw_lines[1] == ""
+    assert json.loads(raw_lines[0])["turn"] == 1
+    assert json.loads(raw_lines[2])["turn"] == 2
+
+
 def test_modifier_assisted_action_presses_and_releases_keys(tmp_path):
     commands = []
     client = FakeClient(
@@ -200,6 +241,41 @@ def test_modifier_assisted_action_presses_and_releases_keys(tmp_path):
         "DISPLAY=:99 xdotool keydown shift",
         "DISPLAY=:99 xdotool mousemove 30 40 click 1",
         "DISPLAY=:99 xdotool keyup shift",
+    ]
+
+
+def test_keypress_chords_normalize_symbol_key_names(tmp_path):
+    commands = []
+    client = FakeClient(
+        [
+            {
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_minus",
+                        "actions": [
+                            {"type": "keypress", "keys": ["CTRL", "MINUS"]},
+                            {"type": "keypress", "keys": ["CTRL", "SHIFT", "MINUS"]},
+                        ],
+                    },
+                ],
+            },
+            final_response(),
+        ],
+    )
+
+    run_computer_use_task(
+        client=client,
+        prompt="Zoom out.",
+        vm=make_vm(commands),
+        output_root=tmp_path,
+    )
+
+    xdotool_commands = [cmd for cmd in commands if "xdotool" in cmd]
+    assert xdotool_commands == [
+        "DISPLAY=:99 xdotool key ctrl+minus",
+        "DISPLAY=:99 xdotool key ctrl+shift+minus",
     ]
 
 

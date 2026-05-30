@@ -36,6 +36,7 @@ def utc_now() -> str:
 def docker_exec(cmd: str, container_name: str, decode: bool = True) -> str | bytes:
     output = subprocess.check_output(
         ["docker", "exec", container_name, "sh", "-c", cmd],
+        stderr=subprocess.PIPE,
     )
     if decode:
         return output.decode("utf-8", errors="replace")
@@ -90,7 +91,10 @@ def normalize_xdotool_key(key: str) -> str:
     lookup = key.strip().lower()
     aliases = {
         "alt": "alt",
+        "apostrophe": "apostrophe",
         "backspace": "BackSpace",
+        "backslash": "backslash",
+        "comma": "comma",
         "cmd": "super",
         "command": "super",
         "control": "ctrl",
@@ -98,18 +102,30 @@ def normalize_xdotool_key(key: str) -> str:
         "delete": "Delete",
         "down": "Down",
         "enter": "Return",
+        "equal": "equal",
+        "equals": "equal",
         "esc": "Escape",
         "escape": "Escape",
+        "grave": "grave",
+        "hyphen": "minus",
         "left": "Left",
+        "leftbracket": "bracketleft",
         "meta": "super",
+        "minus": "minus",
         "option": "alt",
+        "period": "period",
+        "plus": "plus",
         "return": "Return",
         "right": "Right",
+        "rightbracket": "bracketright",
+        "semicolon": "semicolon",
         "shift": "shift",
+        "slash": "slash",
         "space": "space",
         "super": "super",
         "tab": "Tab",
         "up": "Up",
+        "-": "minus",
     }
     return aliases.get(lookup, key)
 
@@ -212,7 +228,7 @@ def handle_computer_actions(vm: VM, actions: Iterable[Any]) -> None:
                     raise ValueError("keypress action did not include keys")
                 vm.exec(
                     f"{display_prefix(vm)} xdotool key "
-                    + " ".join(shell_quote(key) for key in normalized),
+                    + shell_quote("+".join(normalized)),
                 )
             elif action_type == "drag":
                 path = normalize_drag_path(get_value(action, "path", []))
@@ -308,7 +324,20 @@ class TrajectoryRecorder:
         )
 
     def flush_actions(self) -> None:
-        payload = "".join(json.dumps(action, sort_keys=True) + "\n" for action in self.actions)
+        lines: list[str] = []
+        previous_turn: int | None = None
+
+        for action in self.actions:
+            turn = action.get("turn")
+            if previous_turn is not None and turn != previous_turn:
+                lines.append("")
+            lines.append(json.dumps(action, sort_keys=True))
+            previous_turn = turn
+
+        if lines:
+            lines.append("")
+
+        payload = "\n".join(lines)
         self.actions_path.write_text(payload, encoding="utf-8")
 
     def append_jsonl(self, path: Path, payload: dict[str, Any]) -> None:
