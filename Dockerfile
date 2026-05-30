@@ -10,6 +10,7 @@ RUN apt-get update \
         xdotool \
         imagemagick \
         x11-apps \
+        dbus-x11 \
         sudo \
         gnupg \
         software-properties-common \
@@ -36,7 +37,7 @@ CMD ["/bin/sh", "-c", "\
     Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 & \
     x11vnc -display :99 -forever -rfbauth /home/myuser/.vncpass -listen 0.0.0.0 -rfbport 5900 >/dev/null 2>&1 & \
     export DISPLAY=:99 && \
-    startxfce4 >/dev/null 2>&1 & \
+    dbus-launch --exit-with-session startxfce4 >/dev/null 2>&1 & \
     sleep 2 && echo 'Container running!' && \
     tail -f /dev/null \
 "]
