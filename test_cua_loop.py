@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
 
 from cua_loop import (
+    InputArbiter,
     SafetyCheckRequired,
     VM,
     run_computer_use_task,
@@ -56,7 +58,7 @@ def make_vm(commands, *, fail_on: str | None = None):
         commands.append(cmd)
         if fail_on and fail_on in cmd:
             raise RuntimeError("boom")
-        if "import -window root png:-" in cmd:
+        if "import -window" in cmd:
             return b"png-bytes" if not decode else "png-bytes"
         return "" if decode else b""
 
@@ -160,6 +162,80 @@ def test_batched_actions_execute_in_order_and_are_logged(tmp_path):
     actions = read_jsonl(recorder.actions_path)
     assert [item["action"]["type"] for item in actions] == ["click", "type"]
     assert [item["status"] for item in actions] == ["completed", "completed"]
+
+
+def test_window_targeted_click_focuses_and_uses_window_relative_coordinates(tmp_path):
+    commands = []
+    client = FakeClient(
+        [
+            {
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_window",
+                        "actions": [{"type": "click", "x": 10, "y": 20}],
+                    },
+                ],
+            },
+            final_response(),
+        ],
+    )
+
+    run_computer_use_task(
+        client=client,
+        prompt="Click in the assigned window.",
+        vm=make_vm(commands),
+        output_root=tmp_path,
+        window_id="0x123",
+    )
+
+    xdotool_commands = [cmd for cmd in commands if "xdotool" in cmd]
+    assert xdotool_commands == [
+        "DISPLAY=:99 xdotool windowactivate --sync 0x123 windowraise 0x123",
+        "DISPLAY=:99 xdotool mousemove --window 0x123 10 20 click 1",
+    ]
+
+
+def test_window_targeted_screenshot_uses_window_id(tmp_path):
+    commands = []
+    client = FakeClient([final_response()])
+
+    run_computer_use_task(
+        client=client,
+        prompt="Inspect the assigned window.",
+        vm=make_vm(commands),
+        output_root=tmp_path,
+        window_id="0x123",
+    )
+
+    import_commands = [cmd for cmd in commands if "import -window" in cmd]
+    assert import_commands == [
+        "export DISPLAY=:99 && import -window 0x123 png:-",
+    ]
+
+
+def test_input_arbiter_serializes_concurrent_actions_fifo():
+    commands = []
+    vm = make_vm(commands)
+
+    async def run() -> None:
+        async with InputArbiter(vm) as arbiter:
+            first = asyncio.create_task(
+                arbiter.submit_action({"type": "click", "x": 1, "y": 2}),
+            )
+            second = asyncio.create_task(
+                arbiter.submit_action({"type": "type", "text": "hi"}),
+            )
+            await asyncio.gather(first, second)
+
+    asyncio.run(run())
+
+    xdotool_commands = [cmd for cmd in commands if "xdotool" in cmd]
+    assert xdotool_commands == [
+        "DISPLAY=:99 xdotool mousemove 1 2 click 1",
+        "DISPLAY=:99 xdotool type --delay 0 hi",
+    ]
 
 
 def test_actions_jsonl_inserts_blank_lines_between_turns(tmp_path):
@@ -328,6 +404,7 @@ def test_safety_checks_stop_without_acknowledgement(tmp_path):
     assert trajectory["status"] == "blocked"
     assert "Pending safety checks" in trajectory["error"]
     assert len(client.responses.requests) == 1
+    assert [cmd for cmd in commands if "xdotool" in cmd] == []
 
 
 def test_action_failure_is_persisted(tmp_path):

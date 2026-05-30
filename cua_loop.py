@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import json
 import os
@@ -59,6 +60,92 @@ def shell_quote(value: Any) -> str:
 
 def display_prefix(vm: VM) -> str:
     return f"DISPLAY={shell_quote(vm.display)}"
+
+
+@dataclass
+class ArbiterRequest:
+    kind: str
+    future: asyncio.Future[Any]
+    action: Any | None = None
+    window_id: str | None = None
+
+
+class InputArbiter:
+    def __init__(self, vm: VM) -> None:
+        self.vm = vm
+        self._queue: asyncio.Queue[ArbiterRequest] = asyncio.Queue()
+        self._worker: asyncio.Task[None] | None = None
+
+    def start(self) -> "InputArbiter":
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._run())
+        return self
+
+    async def stop(self) -> None:
+        if self._worker is None:
+            return
+        await self._queue.join()
+        self._worker.cancel()
+        try:
+            await self._worker
+        except asyncio.CancelledError:
+            pass
+        self._worker = None
+
+    async def __aenter__(self) -> "InputArbiter":
+        return self.start()
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.stop()
+
+    async def submit_action(self, action: Any, window_id: str | None = None) -> None:
+        await self._submit("action", action=action, window_id=window_id)
+
+    async def screenshot(self, window_id: str | None = None) -> bytes:
+        return await self._submit("screenshot", window_id=window_id)
+
+    async def _submit(
+        self,
+        kind: str,
+        *,
+        action: Any | None = None,
+        window_id: str | None = None,
+    ) -> Any:
+        self.start()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        await self._queue.put(
+            ArbiterRequest(kind=kind, future=future, action=action, window_id=window_id),
+        )
+        return await future
+
+    async def _run(self) -> None:
+        while True:
+            request = await self._queue.get()
+            try:
+                if request.kind == "action":
+                    result = await asyncio.to_thread(
+                        handle_computer_actions,
+                        self.vm,
+                        [request.action],
+                        request.window_id,
+                    )
+                elif request.kind == "screenshot":
+                    result = await asyncio.to_thread(
+                        capture_screenshot,
+                        self.vm,
+                        request.window_id,
+                    )
+                else:
+                    raise ValueError(f"Unsupported arbiter request: {request.kind}")
+            except Exception as error:
+                if not request.future.done():
+                    request.future.set_exception(error)
+            else:
+                if not request.future.done():
+                    request.future.set_result(result)
+            finally:
+                self._queue.task_done()
 
 
 def get_value(item: Any, key: str, default: Any = None) -> Any:
@@ -186,7 +273,27 @@ def _number(action: Any, *keys: str, default: float = 0) -> float:
     return default
 
 
-def handle_computer_actions(vm: VM, actions: Iterable[Any]) -> None:
+def activate_window(vm: VM, window_id: str | None) -> None:
+    if not window_id:
+        return
+    quoted = shell_quote(window_id)
+    vm.exec(f"{display_prefix(vm)} xdotool windowactivate --sync {quoted} windowraise {quoted}")
+
+
+def mousemove_command(vm: VM, x: int, y: int, window_id: str | None) -> str:
+    if window_id:
+        return (
+            f"{display_prefix(vm)} xdotool mousemove --window "
+            f"{shell_quote(window_id)} {x} {y}"
+        )
+    return f"{display_prefix(vm)} xdotool mousemove {x} {y}"
+
+
+def handle_computer_actions(
+    vm: VM,
+    actions: Iterable[Any],
+    window_id: str | None = None,
+) -> None:
     for action in actions:
         action_type = str(get_value(action, "type", ""))
         x = int(round(_number(action, "x")))
@@ -194,21 +301,23 @@ def handle_computer_actions(vm: VM, actions: Iterable[Any]) -> None:
         button = _button_number(get_value(action, "button", "left"))
         keys = _action_keys(action)
 
+        activate_window(vm, window_id)
+
         def run_action() -> None:
             if action_type == "click":
                 vm.exec(
-                    f"{display_prefix(vm)} xdotool mousemove {x} {y} click {button}",
+                    f"{mousemove_command(vm, x, y, window_id)} click {button}",
                 )
             elif action_type == "double_click":
                 vm.exec(
-                    f"{display_prefix(vm)} xdotool mousemove {x} {y} click --repeat 2 {button}",
+                    f"{mousemove_command(vm, x, y, window_id)} click --repeat 2 {button}",
                 )
             elif action_type == "move":
-                vm.exec(f"{display_prefix(vm)} xdotool mousemove {x} {y}")
+                vm.exec(mousemove_command(vm, x, y, window_id))
             elif action_type == "scroll":
                 dx = _number(action, "scroll_x", "scrollX", "delta_x", "deltaX")
                 dy = _number(action, "scroll_y", "scrollY", "delta_y", "deltaY")
-                vm.exec(f"{display_prefix(vm)} xdotool mousemove {x} {y}")
+                vm.exec(mousemove_command(vm, x, y, window_id))
                 if dy:
                     scroll_button = 5 if dy > 0 else 4
                     for _ in range(max(1, int(abs(dy) // 100) or 1)):
@@ -235,9 +344,9 @@ def handle_computer_actions(vm: VM, actions: Iterable[Any]) -> None:
                 if len(path) < 2:
                     raise ValueError("drag action did not include a valid path")
                 start_x, start_y = path[0]
-                vm.exec(f"{display_prefix(vm)} xdotool mousemove {start_x} {start_y} mousedown 1")
+                vm.exec(f"{mousemove_command(vm, start_x, start_y, window_id)} mousedown 1")
                 for point_x, point_y in path[1:]:
-                    vm.exec(f"{display_prefix(vm)} xdotool mousemove {point_x} {point_y}")
+                    vm.exec(mousemove_command(vm, point_x, point_y, window_id))
                 vm.exec(f"{display_prefix(vm)} xdotool mouseup 1")
             elif action_type == "wait":
                 duration_ms = _number(action, "ms", "duration_ms", default=2000)
@@ -250,9 +359,10 @@ def handle_computer_actions(vm: VM, actions: Iterable[Any]) -> None:
         with_modifiers(vm, keys if action_type != "keypress" else [], run_action)
 
 
-def capture_screenshot(vm: VM) -> bytes:
+def capture_screenshot(vm: VM, window_id: str | None = None) -> bytes:
+    target = shell_quote(window_id or "root")
     screenshot = vm.exec(
-        f"export DISPLAY={shell_quote(vm.display)} && import -window root png:-",
+        f"export DISPLAY={shell_quote(vm.display)} && import -window {target} png:-",
         decode=False,
     )
     if not isinstance(screenshot, bytes):
@@ -471,13 +581,14 @@ def screenshot_input(data: bytes) -> dict[str, Any]:
     }
 
 
-def computer_use_loop(
+async def computer_use_loop_async(
     *,
     client: Any,
     model: str,
     recorder: TrajectoryRecorder,
     response: Any,
-    vm: VM,
+    arbiter: InputArbiter,
+    window_id: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
 ) -> Any:
     current_response = response
@@ -511,13 +622,13 @@ def computer_use_loop(
                     turn=turn,
                 )
                 try:
-                    handle_computer_actions(vm, [action])
+                    await arbiter.submit_action(action, window_id=window_id)
                 except Exception as error:
                     recorder.mark_action_failed(record_id, error)
                     try:
                         recorder.record_screenshot(
                             f"{turn:03d}-failure-after-call-{call_id or 'unknown'}",
-                            capture_screenshot(vm),
+                            await arbiter.screenshot(window_id=window_id),
                         )
                     except Exception:
                         pass
@@ -525,7 +636,7 @@ def computer_use_loop(
                     raise
                 recorder.mark_action_completed(record_id)
 
-            screenshot = capture_screenshot(vm)
+            screenshot = await arbiter.screenshot(window_id=window_id)
             recorder.record_screenshot(
                 f"{turn:03d}-after-call-{call_id or 'unknown'}",
                 screenshot,
@@ -538,7 +649,8 @@ def computer_use_loop(
                 },
             )
 
-        current_response = client.responses.create(
+        current_response = await asyncio.to_thread(
+            client.responses.create,
             model=model,
             previous_response_id=response_id(current_response),
             tools=[{"type": "computer"}],
@@ -550,10 +662,79 @@ def computer_use_loop(
     raise RuntimeError(message)
 
 
+def computer_use_loop(
+    *,
+    client: Any,
+    model: str,
+    recorder: TrajectoryRecorder,
+    response: Any,
+    vm: VM,
+    window_id: str | None = None,
+    max_turns: int = DEFAULT_MAX_TURNS,
+) -> Any:
+    async def run() -> Any:
+        async with InputArbiter(vm) as arbiter:
+            return await computer_use_loop_async(
+                client=client,
+                model=model,
+                recorder=recorder,
+                response=response,
+                arbiter=arbiter,
+                window_id=window_id,
+                max_turns=max_turns,
+            )
+
+    return asyncio.run(run())
+
+
 def make_openai_client() -> Any:
     from openai import OpenAI
 
     return OpenAI()
+
+
+async def run_computer_use_task_async(
+    *,
+    client: Any,
+    prompt: str,
+    vm: VM,
+    model: str = DEFAULT_MODEL,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    output_root: Path = Path(DEFAULT_OUTPUT_DIR),
+    window_id: str | None = None,
+    arbiter: InputArbiter | None = None,
+) -> tuple[Any, TrajectoryRecorder]:
+    recorder = TrajectoryRecorder(output_root, prompt=prompt, model=model, vm=vm)
+    owns_arbiter = arbiter is None
+    if arbiter is None:
+        arbiter = InputArbiter(vm)
+    arbiter.start()
+
+    try:
+        recorder.record_screenshot("000-initial", await arbiter.screenshot(window_id=window_id))
+        first_response = await asyncio.to_thread(
+            client.responses.create,
+            model=model,
+            tools=[{"type": "computer"}],
+            input=prompt,
+        )
+        final_response = await computer_use_loop_async(
+            client=client,
+            model=model,
+            recorder=recorder,
+            response=first_response,
+            arbiter=arbiter,
+            window_id=window_id,
+            max_turns=max_turns,
+        )
+        return final_response, recorder
+    except Exception as error:
+        if recorder.trajectory["status"] == "running":
+            recorder.finish("failed", error=str(error))
+        raise
+    finally:
+        if owns_arbiter:
+            await arbiter.stop()
 
 
 def run_computer_use_task(
@@ -564,29 +745,19 @@ def run_computer_use_task(
     model: str = DEFAULT_MODEL,
     max_turns: int = DEFAULT_MAX_TURNS,
     output_root: Path = Path(DEFAULT_OUTPUT_DIR),
+    window_id: str | None = None,
 ) -> tuple[Any, TrajectoryRecorder]:
-    recorder = TrajectoryRecorder(output_root, prompt=prompt, model=model, vm=vm)
-    recorder.record_screenshot("000-initial", capture_screenshot(vm))
-
-    try:
-        first_response = client.responses.create(
-            model=model,
-            tools=[{"type": "computer"}],
-            input=prompt,
-        )
-        final_response = computer_use_loop(
+    return asyncio.run(
+        run_computer_use_task_async(
             client=client,
-            model=model,
-            recorder=recorder,
-            response=first_response,
+            prompt=prompt,
             vm=vm,
+            model=model,
             max_turns=max_turns,
-        )
-        return final_response, recorder
-    except Exception as error:
-        if recorder.trajectory["status"] == "running":
-            recorder.finish("failed", error=str(error))
-        raise
+            output_root=output_root,
+            window_id=window_id,
+        ),
+    )
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -597,6 +768,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--model", default=os.environ.get("CUA_MODEL", DEFAULT_MODEL), help="OpenAI model.")
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS, help="Maximum Responses turns.")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory for trajectory artifacts.")
+    parser.add_argument("--window-id", default=None, help="Optional X11 window id to target for actions and screenshots.")
     return parser.parse_args(argv)
 
 
@@ -613,6 +785,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             max_turns=args.max_turns,
             output_root=Path(args.output_dir),
+            window_id=args.window_id,
         )
     except SafetyCheckRequired as error:
         print(str(error), file=sys.stderr)
