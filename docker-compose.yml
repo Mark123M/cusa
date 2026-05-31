@@ -1,0 +1,15 @@
+services:
+  cua:
+    build: .
+    image: cua-image
+    container_name: cua-image
+    ports:
+      - "5900:5900"
+    environment:
+      - DISPLAY=:99
+    volumes:
+      # Downloads persist on the host (project-local, git-ignored) and
+      # survive container removal AND image rebuilds. Only Downloads is
+      # mounted on purpose: bind-mounting all of /home/myuser would shadow
+      # the build-time .vncpass and break VNC auth.
+      - ./downloads:/home/myuser/Downloads
