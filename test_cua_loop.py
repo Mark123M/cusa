@@ -8,12 +8,21 @@ import pytest
 
 import cua_loop
 from cua_loop import (
+    ComputerUseSubagentPool,
     InputArbiter,
+    PooledSubagent,
     SafetyCheckRequired,
+    StageResult,
     StaleWindowError,
+    TaskProgress,
     VM,
     WindowAssignment,
     _parse_wmctrl_lpxg,
+    append_stage_result,
+    build_planner_prompt,
+    format_task_progress_ledger,
+    latest_screenshots_by_window,
+    latest_screenshots_for_progress,
     list_windows,
     normalize_window_id,
     run_computer_use_task,
@@ -94,6 +103,133 @@ def registry_responses():
     }
 
 
+def direct_assignment(
+    window_id: str = "0x03a00007",
+    logical_id: str = "firefox_1",
+    pid: int | None = 1234,
+) -> WindowAssignment:
+    return WindowAssignment(logical_id=logical_id, window_id=window_id, pid=pid)
+
+
+def test_task_progress_ledger_groups_stage_results_by_window():
+    progress = TaskProgress(original_prompt="Prepare the report.")
+    assert append_stage_result(
+        progress,
+        WindowAssignment(logical_id="firefox_1", window_id="0x03a00007"),
+        StageResult(
+            what_they_did="Opened the source page.",
+            steps_taken="Focused Firefox and inspected the visible tabs.",
+            failure_reason="",
+        ),
+    )
+    assert append_stage_result(
+        progress,
+        WindowAssignment(logical_id="xfce4_terminal_1", window_id="0x03c00001"),
+        StageResult(
+            what_they_did="Tried to run the export command.",
+            steps_taken="Focused the terminal and entered the command.",
+            failure_reason="Command failed because credentials were missing.",
+        ),
+    )
+    assert not append_stage_result(
+        progress,
+        None,
+        StageResult(
+            what_they_did="Ignored desktop-wide result.",
+            steps_taken="No window was available.",
+            failure_reason="",
+        ),
+    )
+
+    assert progress.results_by_window == {
+        "firefox_1": [
+            StageResult(
+                what_they_did="Opened the source page.",
+                steps_taken="Focused Firefox and inspected the visible tabs.",
+                failure_reason="",
+            ),
+        ],
+        "xfce4_terminal_1": [
+            StageResult(
+                what_they_did="Tried to run the export command.",
+                steps_taken="Focused the terminal and entered the command.",
+                failure_reason="Command failed because credentials were missing.",
+            ),
+        ],
+    }
+    assert format_task_progress_ledger(progress) == "\n".join(
+        [
+            "## firefox_1",
+            "### Iteration 1",
+            "- What they did: Opened the source page.",
+            "- Steps taken: Focused Firefox and inspected the visible tabs.",
+            "- Failure reason: ",
+            "## xfce4_terminal_1",
+            "### Iteration 1",
+            "- What they did: Tried to run the export command.",
+            "- Steps taken: Focused the terminal and entered the command.",
+            "- Failure reason: Command failed because credentials were missing.",
+        ],
+    )
+    prompt = build_planner_prompt(progress)
+    assert "TODO: central planner guidelines placeholder." in prompt
+    assert "Original prompt:\nPrepare the report." in prompt
+    assert "Progress ledger:\n## firefox_1" in prompt
+
+
+def test_latest_screenshot_helpers_ignore_windowless_artifacts():
+    progress = TaskProgress(
+        original_prompt="Work across windows.",
+        results_by_window={
+            "firefox_1": [StageResult("Read page", "Focused Firefox", "")],
+            "terminal_1": [StageResult("Ran command", "Focused Terminal", "")],
+        },
+    )
+    screenshots = [
+        {"path": "screenshots/call_1/firefox_1/old.png", "window": "firefox_1"},
+        {"path": "screenshots/call_2/firefox_1/new.png", "window": "firefox_1"},
+        {"path": "screenshots/call_3/terminal_1/latest.png", "window": "terminal_1"},
+        {"path": "screenshots/call_4/desktop/ignored.png"},
+    ]
+
+    latest = latest_screenshots_by_window(screenshots)
+    assert latest == {
+        "firefox_1": {"path": "screenshots/call_2/firefox_1/new.png", "window": "firefox_1"},
+        "terminal_1": {"path": "screenshots/call_3/terminal_1/latest.png", "window": "terminal_1"},
+    }
+    assert latest_screenshots_for_progress(progress, screenshots) == [
+        {"path": "screenshots/call_2/firefox_1/new.png", "window": "firefox_1"},
+        {"path": "screenshots/call_3/terminal_1/latest.png", "window": "terminal_1"},
+    ]
+
+
+def test_subagent_pool_invokes_same_agent_with_different_windows():
+    invocations = []
+    first_assignment = direct_assignment("0x123", "paint_1")
+    second_assignment = direct_assignment("0x456", "terminal_1")
+
+    async def invoke(window_id, prompt):
+        invocations.append((window_id, prompt))
+        return StageResult(
+            what_they_did=f"Handled {prompt}",
+            steps_taken=f"Used {window_id.window_id}",
+            failure_reason="",
+        )
+
+    pool = ComputerUseSubagentPool([PooledSubagent(name="worker-1", invoke=invoke)])
+
+    async def run():
+        first = await pool.invoke(first_assignment, "paint")
+        second = await pool.invoke(second_assignment, "terminal")
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert invocations == [(first_assignment, "paint"), (second_assignment, "terminal")]
+    assert first.what_they_did == "Handled paint"
+    assert second.steps_taken == "Used 0x456"
+
+
 def test_normalize_window_id_accepts_hex_and_decimal():
     assert normalize_window_id("0x123") == 291
     assert normalize_window_id("291") == 291
@@ -135,6 +271,75 @@ def test_list_windows_cli_prints_json_without_prompt(monkeypatch, capsys):
     assert payload["windows"][0]["window_id"] == "0x03a00007"
 
 
+def test_cli_rejects_logical_id_as_window_id(monkeypatch, capsys):
+    vm = make_vm([], responses=registry_responses())
+    monkeypatch.setattr(cua_loop, "VM", lambda display, container_name: vm)
+    monkeypatch.setattr(
+        cua_loop,
+        "make_openai_client",
+        lambda: pytest.fail("invalid window id should not create an OpenAI client"),
+    )
+
+    result = cua_loop.main(
+        [
+            "--prompt",
+            "Can you print hello world?",
+            "--window-id",
+            "xfce4_terminal_1",
+        ],
+    )
+
+    assert result == 2
+    assert "not a logical_id" in capsys.readouterr().err
+
+
+def test_cli_rejects_missing_window_id(monkeypatch, capsys):
+    vm = make_vm([], responses=registry_responses())
+    monkeypatch.setattr(cua_loop, "VM", lambda display, container_name: vm)
+    monkeypatch.setattr(
+        cua_loop,
+        "make_openai_client",
+        lambda: pytest.fail("missing window id should not create an OpenAI client"),
+    )
+
+    result = cua_loop.main(["--prompt", "Click.", "--window-id", "0x999"])
+
+    assert result == 2
+    assert "Window id not found: 0x999" in capsys.readouterr().err
+
+
+def test_cli_marshals_window_id_to_assignment(monkeypatch, capsys):
+    captured = {}
+    vm = make_vm([], responses=registry_responses())
+    monkeypatch.setattr(cua_loop, "VM", lambda display, container_name: vm)
+    monkeypatch.setattr(cua_loop, "make_openai_client", lambda: object())
+
+    class Recorder:
+        run_dir = Path("run")
+
+    def fake_run_computer_use_task(**kwargs):
+        captured.update(kwargs)
+        return final_response(), Recorder()
+
+    monkeypatch.setattr(cua_loop, "run_computer_use_task", fake_run_computer_use_task)
+
+    result = cua_loop.main(
+        [
+            "--prompt",
+            "Inspect Firefox.",
+            "--window-id",
+            "0x03a00007",
+        ],
+    )
+
+    assert result == 0
+    assert isinstance(captured["window_id"], WindowAssignment)
+    assert captured["window_id"].logical_id == "firefox_1"
+    assert captured["window_id"].window_id == "0x03a00007"
+    assert captured["window_id"].pid == 1234
+    assert "Done." in capsys.readouterr().out
+
+
 def test_first_request_uses_computer_tool(tmp_path):
     commands = []
     client = FakeClient([final_response()])
@@ -149,7 +354,8 @@ def test_first_request_uses_computer_tool(tmp_path):
     assert client.responses.requests[0]["input"] == "Inspect the desktop."
     trajectory = read_json(recorder.trajectory_path)
     assert trajectory["status"] == "completed"
-    assert trajectory["screenshots"][0]["path"] == "screenshots/000-initial.png"
+    assert trajectory["screenshots"] == []
+    assert [cmd for cmd in commands if "import -window" in cmd] == []
 
 
 def test_screenshot_first_turn_returns_screenshot_output(tmp_path):
@@ -173,8 +379,9 @@ def test_screenshot_first_turn_returns_screenshot_output(tmp_path):
     _, recorder = run_computer_use_task(
         client=client,
         prompt="Look around.",
-        vm=make_vm(commands),
+        vm=make_vm(commands, responses=registry_responses()),
         output_root=tmp_path,
+        window_id=direct_assignment(),
     )
 
     assert len(client.responses.requests) == 2
@@ -190,7 +397,11 @@ def test_screenshot_first_turn_returns_screenshot_output(tmp_path):
             },
         },
     ]
-    assert Path(recorder.run_dir, "screenshots/001-after-call-call_1.png").exists()
+    trajectory = read_json(recorder.trajectory_path)
+    assert trajectory["screenshots"][0]["path"] == "screenshots/initial/firefox_1/000-initial.png"
+    assert trajectory["screenshots"][0]["call_id"] == "initial"
+    assert trajectory["screenshots"][0]["window"] == "firefox_1"
+    assert Path(recorder.run_dir, "screenshots/call_1/firefox_1/001-after-call-call_1.png").exists()
     actions = read_jsonl(recorder.actions_path)
     assert actions[0]["action"]["type"] == "screenshot"
     assert actions[0]["status"] == "completed"
@@ -232,6 +443,9 @@ def test_batched_actions_execute_in_order_and_are_logged(tmp_path):
     actions = read_jsonl(recorder.actions_path)
     assert [item["action"]["type"] for item in actions] == ["click", "type"]
     assert [item["status"] for item in actions] == ["completed", "completed"]
+    assert client.responses.requests[1]["input"] == []
+    assert read_json(recorder.trajectory_path)["screenshots"] == []
+    assert [cmd for cmd in commands if "import -window" in cmd] == []
 
 
 def test_window_targeted_click_focuses_and_uses_window_relative_coordinates(tmp_path):
@@ -255,15 +469,15 @@ def test_window_targeted_click_focuses_and_uses_window_relative_coordinates(tmp_
     run_computer_use_task(
         client=client,
         prompt="Click in the assigned window.",
-        vm=make_vm(commands),
+        vm=make_vm(commands, responses=registry_responses()),
         output_root=tmp_path,
-        window_id="0x123",
+        window_id=direct_assignment(),
     )
 
     xdotool_commands = [cmd for cmd in commands if "xdotool" in cmd]
     assert xdotool_commands == [
-        "DISPLAY=:99 xdotool windowactivate --sync 0x123 windowraise 0x123",
-        "DISPLAY=:99 xdotool mousemove --window 0x123 10 20 click 1",
+        "DISPLAY=:99 xdotool windowactivate --sync 0x03a00007 windowraise 0x03a00007",
+        "DISPLAY=:99 xdotool mousemove --window 0x03a00007 10 20 click 1",
     ]
 
 
@@ -271,19 +485,20 @@ def test_window_targeted_screenshot_uses_window_id(tmp_path):
     commands = []
     client = FakeClient([final_response()])
 
-    run_computer_use_task(
+    _, recorder = run_computer_use_task(
         client=client,
         prompt="Inspect the assigned window.",
-        vm=make_vm(commands),
+        vm=make_vm(commands, responses=registry_responses()),
         output_root=tmp_path,
-        window_id="0x123",
+        window_id=direct_assignment(),
     )
 
     import_commands = [cmd for cmd in commands if "import -window" in cmd]
     assert import_commands == [
-        "export DISPLAY=:99 && import -window 0x123 png:-",
+        "export DISPLAY=:99 && import -window 0x03a00007 png:-",
     ]
-    assert not any("wmctrl" in cmd for cmd in commands)
+    trajectory = read_json(recorder.trajectory_path)
+    assert trajectory["screenshots"][0]["path"] == "screenshots/initial/firefox_1/000-initial.png"
 
 
 def test_window_assignment_validates_stage_start_and_records_snapshot(tmp_path):
@@ -309,6 +524,8 @@ def test_window_assignment_validates_stage_start_and_records_snapshot(tmp_path):
     assert snapshots[0]["assignment"]["logical_id"] == "firefox_1"
     assert snapshots[0]["windows"][0]["logical_id"] == "firefox_1"
     assert trajectory["files"]["window_snapshots"] == "window_snapshots.jsonl"
+    assert trajectory["screenshots"][0]["path"] == "screenshots/initial/firefox_1/000-initial.png"
+    assert trajectory["screenshots"][0]["window"] == "firefox_1"
     assert any("wmctrl -lpxG" in cmd for cmd in commands)
 
 
@@ -572,6 +789,7 @@ def test_safety_checks_stop_without_acknowledgement(tmp_path):
     assert "Pending safety checks" in trajectory["error"]
     assert len(client.responses.requests) == 1
     assert [cmd for cmd in commands if "xdotool" in cmd] == []
+    assert [cmd for cmd in commands if "import -window" in cmd] == []
 
 
 def test_action_failure_is_persisted(tmp_path):
@@ -605,7 +823,8 @@ def test_action_failure_is_persisted(tmp_path):
     assert actions[0]["status"] == "failed"
     assert actions[0]["error"] == "boom"
     assert trajectory["status"] == "failed"
-    assert (run_dirs[0] / "screenshots/001-failure-after-call-call_fail.png").exists()
+    assert trajectory["screenshots"] == []
+    assert [cmd for cmd in commands if "import -window" in cmd] == []
 
 
 def test_stale_activation_failure_is_structured_and_not_retried(tmp_path):
@@ -629,16 +848,20 @@ def test_stale_activation_failure_is_structured_and_not_retried(tmp_path):
         run_computer_use_task(
             client=client,
             prompt="Click.",
-            vm=make_vm(commands, fail_on="xdotool windowactivate --sync 0x123"),
+            vm=make_vm(
+                commands,
+                fail_on="xdotool windowactivate --sync 0x03a00007",
+                responses=registry_responses(),
+            ),
             output_root=tmp_path,
-            window_id="0x123",
+            window_id=direct_assignment(),
         )
 
     run_dirs = list(tmp_path.iterdir())
     actions = read_jsonl(run_dirs[0] / "actions.jsonl")
     assert actions[0]["status"] == "failed"
-    assert "Stale window 0x123" in actions[0]["error"]
-    assert not any("xdotool mousemove --window 0x123 5 6" in cmd for cmd in commands)
+    assert "Stale window firefox_1 (0x03a00007)" in actions[0]["error"]
+    assert not any("xdotool mousemove --window 0x03a00007 5 6" in cmd for cmd in commands)
 
 
 def test_stale_screenshot_failure_marks_screenshot_action_failed(tmp_path):
@@ -673,14 +896,14 @@ def test_stale_screenshot_failure_marks_screenshot_action_failed(tmp_path):
             prompt="Screenshot.",
             vm=make_vm(
                 commands,
-                responses={"import -window 0x123": flaky_screenshot},
+                responses=registry_responses() | {"import -window 0x03a00007": flaky_screenshot},
             ),
             output_root=tmp_path,
-            window_id="0x123",
+            window_id=direct_assignment(),
         )
 
     run_dirs = list(tmp_path.iterdir())
     actions = read_jsonl(run_dirs[0] / "actions.jsonl")
     assert actions[0]["status"] == "failed"
-    assert "Stale window 0x123" in actions[0]["error"]
+    assert "Stale window firefox_1 (0x03a00007)" in actions[0]["error"]
     assert import_calls == 2

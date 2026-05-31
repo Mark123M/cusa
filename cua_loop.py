@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import inspect
 import json
 import os
 import re
@@ -11,10 +12,10 @@ import shlex
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable
 
 
 DEFAULT_CONTAINER = "cua-image"
@@ -94,7 +95,131 @@ class WindowAssignment:
     pid: int | None = None
 
 
-WindowTarget = str | WindowAssignment | None
+WindowTarget = WindowAssignment | None
+
+
+@dataclass
+class StageResult:
+    what_they_did: str
+    steps_taken: str
+    failure_reason: str
+
+
+@dataclass
+class TaskProgress:
+    original_prompt: str
+    results_by_window: dict[str, list[StageResult]] = field(default_factory=dict)
+
+
+PLANNER_GUIDELINES = "TODO: central planner guidelines placeholder."
+
+
+def task_window_key(window_id: WindowTarget) -> str | None:
+    if window_id is None:
+        return None
+    return window_id.logical_id or window_id.window_id
+
+
+def append_stage_result(
+    progress: TaskProgress,
+    window_id: WindowTarget,
+    result: StageResult,
+) -> bool:
+    key = task_window_key(window_id)
+    if key is None:
+        return False
+    progress.results_by_window.setdefault(key, []).append(result)
+    return True
+
+
+def format_task_progress_ledger(progress: TaskProgress) -> str:
+    lines: list[str] = []
+    for window, results in progress.results_by_window.items():
+        lines.append(f"## {window}")
+        for index, result in enumerate(results, start=1):
+            lines.extend(
+                [
+                    f"### Iteration {index}",
+                    f"- What they did: {result.what_they_did}",
+                    f"- Steps taken: {result.steps_taken}",
+                    f"- Failure reason: {result.failure_reason}",
+                ],
+            )
+    return "\n".join(lines) if lines else "No stage results yet."
+
+
+def build_planner_prompt(progress: TaskProgress) -> str:
+    return "\n\n".join(
+        [
+            PLANNER_GUIDELINES,
+            f"Original prompt:\n{progress.original_prompt}",
+            f"Progress ledger:\n{format_task_progress_ledger(progress)}",
+        ],
+    )
+
+
+def latest_screenshots_by_window(
+    screenshots: Iterable[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for screenshot in screenshots:
+        window = screenshot.get("window")
+        if window:
+            latest[str(window)] = screenshot
+    return latest
+
+
+def latest_screenshots_for_progress(
+    progress: TaskProgress,
+    screenshots: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    latest = latest_screenshots_by_window(screenshots)
+    return [
+        latest[window]
+        for window in progress.results_by_window
+        if window in latest
+    ]
+
+
+SubagentInvoker = Callable[
+    [WindowTarget, str],
+    StageResult | Awaitable[StageResult],
+]
+
+
+@dataclass
+class PooledSubagent:
+    name: str
+    invoke: SubagentInvoker
+    busy: bool = False
+
+
+class ComputerUseSubagentPool:
+    def __init__(self, subagents: Iterable[PooledSubagent]) -> None:
+        self._subagents = list(subagents)
+
+    async def invoke(self, window_id: WindowTarget, prompt: str) -> StageResult:
+        subagent = self._available_subagent()
+        if subagent is None:
+            raise RuntimeError("No available subagents.")
+
+        subagent.busy = True
+        try:
+            result = subagent.invoke(window_id, prompt)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        except Exception as error:
+            return StageResult(
+                what_they_did="",
+                steps_taken="",
+                failure_reason=str(error),
+            )
+        finally:
+            subagent.busy = False
+
+    def _available_subagent(self) -> PooledSubagent | None:
+        return next((subagent for subagent in self._subagents if not subagent.busy), None)
 
 
 def normalize_window_id(value: Any) -> int:
@@ -110,15 +235,15 @@ def normalize_window_id(value: Any) -> int:
 
 
 def target_window_id(window_id: WindowTarget) -> str | None:
-    if isinstance(window_id, WindowAssignment):
-        return window_id.window_id
-    return window_id
+    if window_id is None:
+        return None
+    return window_id.window_id
 
 
 def target_logical_id(window_id: WindowTarget) -> str | None:
-    if isinstance(window_id, WindowAssignment):
-        return window_id.logical_id
-    return None
+    if window_id is None:
+        return None
+    return window_id.logical_id
 
 
 def _parse_wmctrl_lpxg(output: str) -> list[WindowInfo]:
@@ -182,6 +307,36 @@ def list_windows(vm: VM) -> list[WindowInfo]:
     return _parse_wmctrl_lpxg(raw)
 
 
+def window_assignment_from_info(window: WindowInfo) -> WindowAssignment:
+    return WindowAssignment(
+        logical_id=window.logical_id,
+        window_id=window.window_id,
+        pid=window.pid,
+    )
+
+
+def find_window_info(windows: Iterable[WindowInfo], window_id: Any) -> WindowInfo | None:
+    expected_id = normalize_window_id(window_id)
+    return next(
+        (
+            window
+            for window in windows
+            if normalize_window_id(window.window_id) == expected_id
+        ),
+        None,
+    )
+
+
+def find_window_assignment(
+    windows: Iterable[WindowInfo],
+    window_id: Any,
+) -> WindowAssignment | None:
+    window = find_window_info(windows, window_id)
+    if window is None:
+        return None
+    return window_assignment_from_info(window)
+
+
 def validate_window_assignment(
     vm: VM,
     assignment: WindowAssignment,
@@ -189,15 +344,7 @@ def validate_window_assignment(
     windows: list[WindowInfo] | None = None,
 ) -> WindowInfo:
     registry = windows if windows is not None else list_windows(vm)
-    expected_id = normalize_window_id(assignment.window_id)
-    match = next(
-        (
-            window
-            for window in registry
-            if normalize_window_id(window.window_id) == expected_id
-        ),
-        None,
-    )
+    match = find_window_info(registry, assignment.window_id)
     if match is None:
         raise StaleWindowError(
             assignment.window_id,
@@ -712,14 +859,30 @@ class TrajectoryRecorder:
         self.actions[record_id]["status"] = "failed"
         self.flush_actions()
 
-    def record_screenshot(self, label: str, data: bytes) -> Path:
+    def record_screenshot(
+        self,
+        label: str,
+        data: bytes,
+        *,
+        call_id: Any,
+        window_id: WindowTarget,
+    ) -> Path | None:
+        window = task_window_key(window_id)
+        if window is None:
+            return None
+
         stem = sanitize_filename(label)
-        path = self.screenshots_dir / f"{stem}.png"
+        call_key = sanitize_filename(str(call_id or "unknown"))
+        window_key = sanitize_filename(window)
+        path = self.screenshots_dir / call_key / window_key / f"{stem}.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
         artifact = {
+            "call_id": call_id,
             "captured_at": utc_now(),
             "label": label,
             "path": self.relative(path),
+            "window": window,
         }
         self.screenshots.append(artifact)
         self.flush_trajectory()
@@ -844,19 +1007,27 @@ async def computer_use_loop_async(
                     recorder.mark_action_failed(record_id, error)
                     for pending_record_id in pending_screenshot_records:
                         recorder.mark_action_failed(pending_record_id, error)
-                    try:
-                        recorder.record_screenshot(
-                            f"{turn:03d}-failure-after-call-{call_id or 'unknown'}",
-                            await arbiter.screenshot(window_id=window_id),
-                        )
-                    except Exception:
-                        pass
+                    if target_window_id(window_id) is not None:
+                        try:
+                            recorder.record_screenshot(
+                                f"{turn:03d}-failure-after-call-{call_id or 'unknown'}",
+                                await arbiter.screenshot(window_id=window_id),
+                                call_id=call_id,
+                                window_id=window_id,
+                            )
+                        except Exception:
+                            pass
                     recorder.finish("failed", error=str(error))
                     raise
                 if str(get_value(action, "type", "")) == "screenshot":
                     pending_screenshot_records.append(record_id)
                 else:
                     recorder.mark_action_completed(record_id)
+
+            if target_window_id(window_id) is None:
+                for record_id in pending_screenshot_records:
+                    recorder.mark_action_completed(record_id)
+                continue
 
             try:
                 screenshot = await arbiter.screenshot(window_id=window_id)
@@ -870,6 +1041,8 @@ async def computer_use_loop_async(
             recorder.record_screenshot(
                 f"{turn:03d}-after-call-{call_id or 'unknown'}",
                 screenshot,
+                call_id=call_id,
+                window_id=window_id,
             )
             tool_outputs.append(
                 {
@@ -949,7 +1122,13 @@ async def run_computer_use_task_async(
                 assignment=window_id,
             )
             validate_window_assignment(vm, window_id, windows=windows)
-        recorder.record_screenshot("000-initial", await arbiter.screenshot(window_id=window_id))
+        if target_window_id(window_id) is not None:
+            recorder.record_screenshot(
+                "000-initial",
+                await arbiter.screenshot(window_id=window_id),
+                call_id="initial",
+                window_id=window_id,
+            )
         first_response = await asyncio.to_thread(
             client.responses.create,
             model=model,
@@ -1034,6 +1213,22 @@ def main(argv: list[str] | None = None) -> int:
         print("--prompt is required unless --list-windows is set", file=sys.stderr)
         return 2
 
+    window_assignment: WindowAssignment | None = None
+    if args.window_id:
+        try:
+            windows = list_windows(vm)
+            window_assignment = find_window_assignment(windows, args.window_id)
+        except ValueError:
+            print(
+                f"Invalid --window-id {args.window_id!r}; use an X11 id from --list-windows, not a logical_id.",
+                file=sys.stderr,
+            )
+            return 2
+
+        if window_assignment is None:
+            print(f"Window id not found: {args.window_id}", file=sys.stderr)
+            return 2
+
     client = make_openai_client()
 
     try:
@@ -1044,7 +1239,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             max_turns=args.max_turns,
             output_root=Path(args.output_dir),
-            window_id=args.window_id,
+            window_id=window_assignment,
         )
     except SafetyCheckRequired as error:
         print(str(error), file=sys.stderr)
