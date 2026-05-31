@@ -8,6 +8,7 @@ RUN apt-get update \
         x11vnc \
         xvfb \
         xdotool \
+        wmctrl \
         imagemagick \
         x11-apps \
         dbus-x11 \

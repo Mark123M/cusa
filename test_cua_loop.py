@@ -6,10 +6,16 @@ from pathlib import Path
 
 import pytest
 
+import cua_loop
 from cua_loop import (
     InputArbiter,
     SafetyCheckRequired,
+    StaleWindowError,
     VM,
+    WindowAssignment,
+    _parse_wmctrl_lpxg,
+    list_windows,
+    normalize_window_id,
     run_computer_use_task,
 )
 
@@ -53,16 +59,80 @@ def final_response(text="Done."):
     }
 
 
-def make_vm(commands, *, fail_on: str | None = None):
+def make_vm(commands, *, fail_on: str | None = None, responses=None):
+    responses = responses or {}
+
     def executor(cmd: str, container_name: str, decode: bool = True):
         commands.append(cmd)
         if fail_on and fail_on in cmd:
             raise RuntimeError("boom")
+        for pattern, value in responses.items():
+            if pattern in cmd:
+                result = value(cmd) if callable(value) else value
+                if isinstance(result, BaseException):
+                    raise result
+                return result
         if "import -window" in cmd:
             return b"png-bytes" if not decode else "png-bytes"
         return "" if decode else b""
 
     return VM(display=":99", container_name="cua-image", executor=executor)
+
+
+WMCTRL_SAMPLE = "\n".join(
+    [
+        "0x03a00007  0 1234 10 40 900 700 Navigator.firefox host-a Example - Mozilla Firefox",
+        "not-a-window",
+        "0x03c00001  0 2345 30 50 640 480 xfce4-terminal.Xfce4-terminal host-a Terminal",
+    ],
+)
+
+
+def registry_responses():
+    return {
+        "wmctrl -lpxG": WMCTRL_SAMPLE,
+    }
+
+
+def test_normalize_window_id_accepts_hex_and_decimal():
+    assert normalize_window_id("0x123") == 291
+    assert normalize_window_id("291") == 291
+    assert normalize_window_id(291) == 291
+
+
+def test_wmctrl_parser_skips_malformed_lines_and_assigns_logical_ids():
+    windows = _parse_wmctrl_lpxg(WMCTRL_SAMPLE)
+
+    assert [window.window_id for window in windows] == ["0x03a00007", "0x03c00001"]
+    assert [window.logical_id for window in windows] == ["firefox_1", "xfce4_terminal_1"]
+    assert windows[0].geometry == {"x": 10, "y": 40, "width": 900, "height": 700}
+
+
+def test_list_windows_returns_minimal_registry():
+    commands = []
+    windows = list_windows(make_vm(commands, responses=registry_responses()))
+
+    assert [window.logical_id for window in windows] == ["firefox_1", "xfce4_terminal_1"]
+    assert windows[0].title == "Example - Mozilla Firefox"
+    assert windows[0].pid == 1234
+    assert "DISPLAY=:99 wmctrl -lpxG" in commands
+
+
+def test_list_windows_cli_prints_json_without_prompt(monkeypatch, capsys):
+    commands = []
+    vm = make_vm(commands, responses=registry_responses())
+    monkeypatch.setattr(cua_loop, "VM", lambda display, container_name: vm)
+    monkeypatch.setattr(
+        cua_loop,
+        "make_openai_client",
+        lambda: pytest.fail("list-windows should not create an OpenAI client"),
+    )
+
+    assert cua_loop.main(["--list-windows"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["windows"][0]["logical_id"] == "firefox_1"
+    assert payload["windows"][0]["window_id"] == "0x03a00007"
 
 
 def test_first_request_uses_computer_tool(tmp_path):
@@ -213,6 +283,103 @@ def test_window_targeted_screenshot_uses_window_id(tmp_path):
     assert import_commands == [
         "export DISPLAY=:99 && import -window 0x123 png:-",
     ]
+    assert not any("wmctrl" in cmd for cmd in commands)
+
+
+def test_window_assignment_validates_stage_start_and_records_snapshot(tmp_path):
+    commands = []
+    client = FakeClient([final_response()])
+    assignment = WindowAssignment(
+        logical_id="firefox_1",
+        window_id="0x03a00007",
+        pid=1234,
+    )
+
+    _, recorder = run_computer_use_task(
+        client=client,
+        prompt="Inspect the assigned window.",
+        vm=make_vm(commands, responses=registry_responses()),
+        output_root=tmp_path,
+        window_id=assignment,
+    )
+
+    snapshots = read_jsonl(recorder.window_snapshots_path)
+    trajectory = read_json(recorder.trajectory_path)
+    assert snapshots[0]["label"] == "stage-start"
+    assert snapshots[0]["assignment"]["logical_id"] == "firefox_1"
+    assert snapshots[0]["windows"][0]["logical_id"] == "firefox_1"
+    assert trajectory["files"]["window_snapshots"] == "window_snapshots.jsonl"
+    assert any("wmctrl -lpxG" in cmd for cmd in commands)
+
+
+def test_window_targeted_type_checks_active_window_before_typing(tmp_path):
+    commands = []
+    client = FakeClient(
+        [
+            {
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_type",
+                        "actions": [{"type": "type", "text": "hi"}],
+                    },
+                ],
+            },
+            final_response(),
+        ],
+    )
+    assignment = WindowAssignment(logical_id="firefox_1", window_id="0x03a00007")
+    responses = registry_responses() | {"xdotool getactivewindow": "0x03a00007\n"}
+
+    run_computer_use_task(
+        client=client,
+        prompt="Type in the assigned window.",
+        vm=make_vm(commands, responses=responses),
+        output_root=tmp_path,
+        window_id=assignment,
+    )
+
+    xdotool_commands = [cmd for cmd in commands if "xdotool" in cmd]
+    assert xdotool_commands == [
+        "DISPLAY=:99 xdotool windowactivate --sync 0x03a00007 windowraise 0x03a00007",
+        "DISPLAY=:99 xdotool getactivewindow",
+        "DISPLAY=:99 xdotool type --delay 0 hi",
+    ]
+
+
+def test_window_targeted_type_fails_before_typing_when_focus_check_mismatches(tmp_path):
+    commands = []
+    client = FakeClient(
+        [
+            {
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_type",
+                        "actions": [{"type": "type", "text": "hi"}],
+                    },
+                ],
+            },
+        ],
+    )
+    assignment = WindowAssignment(logical_id="firefox_1", window_id="0x03a00007")
+    responses = registry_responses() | {"xdotool getactivewindow": "0x999\n"}
+
+    with pytest.raises(StaleWindowError):
+        run_computer_use_task(
+            client=client,
+            prompt="Type in the assigned window.",
+            vm=make_vm(commands, responses=responses),
+            output_root=tmp_path,
+            window_id=assignment,
+        )
+
+    run_dirs = list(tmp_path.iterdir())
+    actions = read_jsonl(run_dirs[0] / "actions.jsonl")
+    assert actions[0]["status"] == "failed"
+    assert not any("xdotool type" in cmd for cmd in commands)
 
 
 def test_input_arbiter_serializes_concurrent_actions_fifo():
@@ -439,3 +606,81 @@ def test_action_failure_is_persisted(tmp_path):
     assert actions[0]["error"] == "boom"
     assert trajectory["status"] == "failed"
     assert (run_dirs[0] / "screenshots/001-failure-after-call-call_fail.png").exists()
+
+
+def test_stale_activation_failure_is_structured_and_not_retried(tmp_path):
+    commands = []
+    client = FakeClient(
+        [
+            {
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_window",
+                        "actions": [{"type": "click", "x": 5, "y": 6}],
+                    },
+                ],
+            },
+        ],
+    )
+
+    with pytest.raises(StaleWindowError):
+        run_computer_use_task(
+            client=client,
+            prompt="Click.",
+            vm=make_vm(commands, fail_on="xdotool windowactivate --sync 0x123"),
+            output_root=tmp_path,
+            window_id="0x123",
+        )
+
+    run_dirs = list(tmp_path.iterdir())
+    actions = read_jsonl(run_dirs[0] / "actions.jsonl")
+    assert actions[0]["status"] == "failed"
+    assert "Stale window 0x123" in actions[0]["error"]
+    assert not any("xdotool mousemove --window 0x123 5 6" in cmd for cmd in commands)
+
+
+def test_stale_screenshot_failure_marks_screenshot_action_failed(tmp_path):
+    commands = []
+    import_calls = 0
+
+    def flaky_screenshot(_cmd):
+        nonlocal import_calls
+        import_calls += 1
+        if import_calls == 1:
+            return b"png-bytes"
+        return RuntimeError("window vanished")
+
+    client = FakeClient(
+        [
+            {
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_screenshot",
+                        "actions": [{"type": "screenshot"}],
+                    },
+                ],
+            },
+        ],
+    )
+
+    with pytest.raises(StaleWindowError):
+        run_computer_use_task(
+            client=client,
+            prompt="Screenshot.",
+            vm=make_vm(
+                commands,
+                responses={"import -window 0x123": flaky_screenshot},
+            ),
+            output_root=tmp_path,
+            window_id="0x123",
+        )
+
+    run_dirs = list(tmp_path.iterdir())
+    actions = read_jsonl(run_dirs[0] / "actions.jsonl")
+    assert actions[0]["status"] == "failed"
+    assert "Stale window 0x123" in actions[0]["error"]
+    assert import_calls == 2

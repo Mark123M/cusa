@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import secrets
 import shlex
 import subprocess
@@ -25,6 +26,21 @@ DEFAULT_OUTPUT_DIR = "cua-runs"
 
 class SafetyCheckRequired(RuntimeError):
     pass
+
+
+class StaleWindowError(RuntimeError):
+    def __init__(
+        self,
+        window_id: str,
+        *,
+        logical_id: str | None = None,
+        reason: str,
+    ) -> None:
+        self.window_id = window_id
+        self.logical_id = logical_id
+        self.reason = reason
+        label = f"{logical_id} ({window_id})" if logical_id else window_id
+        super().__init__(f"Stale window {label}: {reason}")
 
 
 DockerExec = Callable[[str, str, bool], str | bytes]
@@ -63,11 +79,146 @@ def display_prefix(vm: VM) -> str:
 
 
 @dataclass
+class WindowInfo:
+    logical_id: str
+    window_id: str
+    title: str
+    pid: int | None
+    geometry: dict[str, int]
+
+
+@dataclass
+class WindowAssignment:
+    logical_id: str
+    window_id: str
+    pid: int | None = None
+
+
+WindowTarget = str | WindowAssignment | None
+
+
+def normalize_window_id(value: Any) -> int:
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        raise ValueError("Window id is empty")
+    try:
+        return int(text, 16) if text.lower().startswith("0x") else int(text, 10)
+    except ValueError as error:
+        raise ValueError(f"Invalid window id: {value!r}") from error
+
+
+def target_window_id(window_id: WindowTarget) -> str | None:
+    if isinstance(window_id, WindowAssignment):
+        return window_id.window_id
+    return window_id
+
+
+def target_logical_id(window_id: WindowTarget) -> str | None:
+    if isinstance(window_id, WindowAssignment):
+        return window_id.logical_id
+    return None
+
+
+def _parse_wmctrl_lpxg(output: str) -> list[WindowInfo]:
+    windows: list[WindowInfo] = []
+    counts: dict[str, int] = {}
+    for line in output.splitlines():
+        parts = line.split(None, 9)
+        if len(parts) < 9:
+            continue
+        try:
+            window_id = parts[0]
+            pid = int(parts[2])
+            x = int(parts[3])
+            y = int(parts[4])
+            width = int(parts[5])
+            height = int(parts[6])
+            normalize_window_id(window_id)
+        except ValueError:
+            continue
+
+        title = parts[9] if len(parts) > 9 else ""
+        wm_class = parts[7] if parts[7] != "N/A" else None
+        base = _logical_id_base(wm_class, title)
+        counts[base] = counts.get(base, 0) + 1
+
+        windows.append(
+            WindowInfo(
+                logical_id=f"{base}_{counts[base]}",
+                window_id=window_id,
+                title=title,
+                pid=pid if pid > 0 else None,
+                geometry={
+                    "x": x,
+                    "y": y,
+                    "width": width,
+                    "height": height,
+                },
+            ),
+        )
+    return windows
+
+
+def _logical_id_base(wm_class: str | None, title: str) -> str:
+    candidates = []
+    if wm_class:
+        candidates.append(wm_class.split(".")[-1])
+    if title:
+        candidates.append(title.split()[0])
+
+    for candidate in candidates:
+        safe = re.sub(r"[^a-z0-9]+", "_", candidate.lower()).strip("_")
+        if safe:
+            return safe
+    return "window"
+
+
+def list_windows(vm: VM) -> list[WindowInfo]:
+    raw = vm.exec(f"{display_prefix(vm)} wmctrl -lpxG")
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    return _parse_wmctrl_lpxg(raw)
+
+
+def validate_window_assignment(
+    vm: VM,
+    assignment: WindowAssignment,
+    *,
+    windows: list[WindowInfo] | None = None,
+) -> WindowInfo:
+    registry = windows if windows is not None else list_windows(vm)
+    expected_id = normalize_window_id(assignment.window_id)
+    match = next(
+        (
+            window
+            for window in registry
+            if normalize_window_id(window.window_id) == expected_id
+        ),
+        None,
+    )
+    if match is None:
+        raise StaleWindowError(
+            assignment.window_id,
+            logical_id=assignment.logical_id,
+            reason="window id is not present in registry",
+        )
+    if assignment.pid is not None and match.pid != assignment.pid:
+        raise StaleWindowError(
+            assignment.window_id,
+            logical_id=assignment.logical_id,
+            reason=f"pid changed from {assignment.pid} to {match.pid}",
+        )
+    return match
+
+
+@dataclass
 class ArbiterRequest:
     kind: str
     future: asyncio.Future[Any]
     action: Any | None = None
-    window_id: str | None = None
+    window_id: WindowTarget = None
 
 
 class InputArbiter:
@@ -98,10 +249,10 @@ class InputArbiter:
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         await self.stop()
 
-    async def submit_action(self, action: Any, window_id: str | None = None) -> None:
+    async def submit_action(self, action: Any, window_id: WindowTarget = None) -> None:
         await self._submit("action", action=action, window_id=window_id)
 
-    async def screenshot(self, window_id: str | None = None) -> bytes:
+    async def screenshot(self, window_id: WindowTarget = None) -> bytes:
         return await self._submit("screenshot", window_id=window_id)
 
     async def _submit(
@@ -109,7 +260,7 @@ class InputArbiter:
         kind: str,
         *,
         action: Any | None = None,
-        window_id: str | None = None,
+        window_id: WindowTarget = None,
     ) -> Any:
         self.start()
         loop = asyncio.get_running_loop()
@@ -273,18 +424,51 @@ def _number(action: Any, *keys: str, default: float = 0) -> float:
     return default
 
 
-def activate_window(vm: VM, window_id: str | None) -> None:
-    if not window_id:
+def activate_window(vm: VM, window_id: WindowTarget) -> None:
+    resolved = target_window_id(window_id)
+    if not resolved:
         return
-    quoted = shell_quote(window_id)
-    vm.exec(f"{display_prefix(vm)} xdotool windowactivate --sync {quoted} windowraise {quoted}")
+    quoted = shell_quote(resolved)
+    try:
+        vm.exec(f"{display_prefix(vm)} xdotool windowactivate --sync {quoted} windowraise {quoted}")
+    except Exception as error:
+        raise StaleWindowError(
+            resolved,
+            logical_id=target_logical_id(window_id),
+            reason=f"activation failed: {error}",
+        ) from error
 
 
-def mousemove_command(vm: VM, x: int, y: int, window_id: str | None) -> str:
-    if window_id:
+def ensure_target_window_is_active(vm: VM, window_id: WindowTarget) -> None:
+    resolved = target_window_id(window_id)
+    if not resolved:
+        return
+    try:
+        active = vm.exec(f"{display_prefix(vm)} xdotool getactivewindow")
+        if isinstance(active, bytes):
+            active = active.decode("utf-8", errors="replace")
+        active_id = normalize_window_id(active)
+        expected_id = normalize_window_id(resolved)
+    except Exception as error:
+        raise StaleWindowError(
+            resolved,
+            logical_id=target_logical_id(window_id),
+            reason=f"active-window check failed: {error}",
+        ) from error
+    if active_id != expected_id:
+        raise StaleWindowError(
+            resolved,
+            logical_id=target_logical_id(window_id),
+            reason=f"active window is {active.strip()}, expected {resolved}",
+        )
+
+
+def mousemove_command(vm: VM, x: int, y: int, window_id: WindowTarget) -> str:
+    resolved = target_window_id(window_id)
+    if resolved:
         return (
             f"{display_prefix(vm)} xdotool mousemove --window "
-            f"{shell_quote(window_id)} {x} {y}"
+            f"{shell_quote(resolved)} {x} {y}"
         )
     return f"{display_prefix(vm)} xdotool mousemove {x} {y}"
 
@@ -292,7 +476,7 @@ def mousemove_command(vm: VM, x: int, y: int, window_id: str | None) -> str:
 def handle_computer_actions(
     vm: VM,
     actions: Iterable[Any],
-    window_id: str | None = None,
+    window_id: WindowTarget = None,
 ) -> None:
     for action in actions:
         action_type = str(get_value(action, "type", ""))
@@ -302,6 +486,8 @@ def handle_computer_actions(
         keys = _action_keys(action)
 
         activate_window(vm, window_id)
+        if action_type in {"type", "keypress"}:
+            ensure_target_window_is_active(vm, window_id)
 
         def run_action() -> None:
             if action_type == "click":
@@ -359,12 +545,22 @@ def handle_computer_actions(
         with_modifiers(vm, keys if action_type != "keypress" else [], run_action)
 
 
-def capture_screenshot(vm: VM, window_id: str | None = None) -> bytes:
-    target = shell_quote(window_id or "root")
-    screenshot = vm.exec(
-        f"export DISPLAY={shell_quote(vm.display)} && import -window {target} png:-",
-        decode=False,
-    )
+def capture_screenshot(vm: VM, window_id: WindowTarget = None) -> bytes:
+    resolved = target_window_id(window_id)
+    target = shell_quote(resolved or "root")
+    try:
+        screenshot = vm.exec(
+            f"export DISPLAY={shell_quote(vm.display)} && import -window {target} png:-",
+            decode=False,
+        )
+    except Exception as error:
+        if resolved:
+            raise StaleWindowError(
+                resolved,
+                logical_id=target_logical_id(window_id),
+                reason=f"screenshot failed: {error}",
+            ) from error
+        raise
     if not isinstance(screenshot, bytes):
         return screenshot.encode("utf-8")
     return screenshot
@@ -392,6 +588,7 @@ class TrajectoryRecorder:
         self.actions_path = self.run_dir / "actions.jsonl"
         self.calls_path = self.run_dir / "computer_calls.jsonl"
         self.trajectory_path = self.run_dir / "trajectory.json"
+        self.window_snapshots_path = self.run_dir / "window_snapshots.jsonl"
         self.actions: list[dict[str, Any]] = []
         self.responses: list[str] = []
         self.screenshots: list[dict[str, Any]] = []
@@ -413,6 +610,7 @@ class TrajectoryRecorder:
                 "computer_calls": "computer_calls.jsonl",
                 "responses": "responses/",
                 "screenshots": "screenshots/",
+                "window_snapshots": "window_snapshots.jsonl",
             },
             "responses": self.responses,
             "screenshots": self.screenshots,
@@ -422,6 +620,7 @@ class TrajectoryRecorder:
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
         self.actions_path.write_text("", encoding="utf-8")
         self.calls_path.write_text("", encoding="utf-8")
+        self.window_snapshots_path.write_text("", encoding="utf-8")
         self.flush_trajectory()
 
     def relative(self, path: Path) -> str:
@@ -526,6 +725,23 @@ class TrajectoryRecorder:
         self.flush_trajectory()
         return path
 
+    def record_window_snapshot(
+        self,
+        label: str,
+        windows: list[WindowInfo],
+        *,
+        assignment: WindowAssignment | None = None,
+    ) -> None:
+        self.append_jsonl(
+            self.window_snapshots_path,
+            {
+                "assignment": to_plain(assignment),
+                "label": label,
+                "recorded_at": utc_now(),
+                "windows": to_plain(windows),
+            },
+        )
+
     def finish(
         self,
         status: str,
@@ -588,7 +804,7 @@ async def computer_use_loop_async(
     recorder: TrajectoryRecorder,
     response: Any,
     arbiter: InputArbiter,
-    window_id: str | None = None,
+    window_id: WindowTarget = None,
     max_turns: int = DEFAULT_MAX_TURNS,
 ) -> Any:
     current_response = response
@@ -614,6 +830,7 @@ async def computer_use_loop_async(
                 raise SafetyCheckRequired(message)
 
             actions = list(get_value(call, "actions", []) or [])
+            pending_screenshot_records: list[int] = []
             for action_index, action in enumerate(actions):
                 record_id = recorder.record_action_decision(
                     action=action,
@@ -625,6 +842,8 @@ async def computer_use_loop_async(
                     await arbiter.submit_action(action, window_id=window_id)
                 except Exception as error:
                     recorder.mark_action_failed(record_id, error)
+                    for pending_record_id in pending_screenshot_records:
+                        recorder.mark_action_failed(pending_record_id, error)
                     try:
                         recorder.record_screenshot(
                             f"{turn:03d}-failure-after-call-{call_id or 'unknown'}",
@@ -634,9 +853,20 @@ async def computer_use_loop_async(
                         pass
                     recorder.finish("failed", error=str(error))
                     raise
-                recorder.mark_action_completed(record_id)
+                if str(get_value(action, "type", "")) == "screenshot":
+                    pending_screenshot_records.append(record_id)
+                else:
+                    recorder.mark_action_completed(record_id)
 
-            screenshot = await arbiter.screenshot(window_id=window_id)
+            try:
+                screenshot = await arbiter.screenshot(window_id=window_id)
+            except Exception as error:
+                for record_id in pending_screenshot_records:
+                    recorder.mark_action_failed(record_id, error)
+                recorder.finish("failed", error=str(error))
+                raise
+            for record_id in pending_screenshot_records:
+                recorder.mark_action_completed(record_id)
             recorder.record_screenshot(
                 f"{turn:03d}-after-call-{call_id or 'unknown'}",
                 screenshot,
@@ -669,7 +899,7 @@ def computer_use_loop(
     recorder: TrajectoryRecorder,
     response: Any,
     vm: VM,
-    window_id: str | None = None,
+    window_id: WindowTarget = None,
     max_turns: int = DEFAULT_MAX_TURNS,
 ) -> Any:
     async def run() -> Any:
@@ -701,7 +931,7 @@ async def run_computer_use_task_async(
     model: str = DEFAULT_MODEL,
     max_turns: int = DEFAULT_MAX_TURNS,
     output_root: Path = Path(DEFAULT_OUTPUT_DIR),
-    window_id: str | None = None,
+    window_id: WindowTarget = None,
     arbiter: InputArbiter | None = None,
 ) -> tuple[Any, TrajectoryRecorder]:
     recorder = TrajectoryRecorder(output_root, prompt=prompt, model=model, vm=vm)
@@ -711,6 +941,14 @@ async def run_computer_use_task_async(
     arbiter.start()
 
     try:
+        if isinstance(window_id, WindowAssignment):
+            windows = await asyncio.to_thread(list_windows, vm)
+            recorder.record_window_snapshot(
+                "stage-start",
+                windows,
+                assignment=window_id,
+            )
+            validate_window_assignment(vm, window_id, windows=windows)
         recorder.record_screenshot("000-initial", await arbiter.screenshot(window_id=window_id))
         first_response = await asyncio.to_thread(
             client.responses.create,
@@ -745,7 +983,7 @@ def run_computer_use_task(
     model: str = DEFAULT_MODEL,
     max_turns: int = DEFAULT_MAX_TURNS,
     output_root: Path = Path(DEFAULT_OUTPUT_DIR),
-    window_id: str | None = None,
+    window_id: WindowTarget = None,
 ) -> tuple[Any, TrajectoryRecorder]:
     return asyncio.run(
         run_computer_use_task_async(
@@ -762,9 +1000,10 @@ def run_computer_use_task(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a Docker-backed OpenAI computer-use loop.")
-    parser.add_argument("--prompt", required=True, help="Task prompt to send to the computer-use model.")
+    parser.add_argument("--prompt", help="Task prompt to send to the computer-use model.")
     parser.add_argument("--container", default=DEFAULT_CONTAINER, help="Docker container name.")
     parser.add_argument("--display", default=DEFAULT_DISPLAY, help="X11 display inside the container.")
+    parser.add_argument("--list-windows", action="store_true", help="Print the current X11 window registry as JSON.")
     parser.add_argument("--model", default=os.environ.get("CUA_MODEL", DEFAULT_MODEL), help="OpenAI model.")
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS, help="Maximum Responses turns.")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory for trajectory artifacts.")
@@ -774,8 +1013,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
-    client = make_openai_client()
     vm = VM(display=args.display, container_name=args.container)
+
+    if args.list_windows:
+        print(
+            json.dumps(
+                {
+                    "captured_at": utc_now(),
+                    "container": vm.container_name,
+                    "display": vm.display,
+                    "windows": to_plain(list_windows(vm)),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+        )
+        return 0
+
+    if not args.prompt:
+        print("--prompt is required unless --list-windows is set", file=sys.stderr)
+        return 2
+
+    client = make_openai_client()
 
     try:
         final_response, recorder = run_computer_use_task(
