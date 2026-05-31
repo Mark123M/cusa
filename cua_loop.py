@@ -15,7 +15,9 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 DEFAULT_CONTAINER = "cua-image"
@@ -111,7 +113,99 @@ class TaskProgress:
     results_by_window: dict[str, list[StageResult]] = field(default_factory=dict)
 
 
-PLANNER_GUIDELINES = "TODO: central planner guidelines placeholder."
+class PlannerOutputError(ValueError):
+    pass
+
+
+class PlannerWindowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    logical_id: str = Field(min_length=1)
+    kind: Literal["browser", "terminal"]
+    reason: str
+
+    @field_validator("logical_id")
+    @classmethod
+    def _strip_logical_id(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("logical_id is required")
+        return stripped
+
+
+class PlannerAssignment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    window: str = Field(min_length=1)
+    subtasks: list[str] = Field(min_length=1)
+
+    @field_validator("window")
+    @classmethod
+    def _strip_window(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("window is required")
+        return stripped
+
+    @field_validator("subtasks")
+    @classmethod
+    def _strip_subtasks(cls, value: list[str]) -> list[str]:
+        subtasks = [item.strip() for item in value if item.strip()]
+        if not subtasks:
+            raise ValueError("at least one subtask is required")
+        return subtasks
+
+
+class PlannerPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    done: bool
+    final_response: str
+    windows_to_open: list[PlannerWindowRequest]
+    assignments: list[PlannerAssignment]
+
+    @model_validator(mode="after")
+    def _validate_done_shape(self) -> "PlannerPlan":
+        if self.done:
+            if self.windows_to_open or self.assignments:
+                raise ValueError("done plans cannot open windows or assign subtasks")
+            if not self.final_response.strip():
+                raise ValueError("done plans must include final_response")
+        return self
+
+
+ALLOWED_WINDOW_OPEN_COMMANDS: dict[str, str] = {
+    "browser": "firefox-esr",
+    "terminal": "xfce4-terminal",
+}
+DEFAULT_SUBAGENTS = 8
+DEFAULT_MAX_STAGES = 20
+DEFAULT_PLANNER_RETRIES = 2
+
+
+PLANNER_GUIDELINES = """\
+You are the central planner for a pool of computer-use subagents in one Linux virtual display.
+
+Return only strict JSON matching the requested schema. Plan one stage at a time.
+- Each assignment must target exactly one visible window logical_id from the latest registry.
+- windows_to_open launches windows for future planner stages; do not assign subtasks to those requested logical_ids until they appear in a later registry.
+- Each assignment's subtasks must be independent of every other assignment in the same stage.
+- If a dependency exists between windows, serialize it by assigning only the prerequisite work in this stage.
+- Do cross-window reasoning yourself after subagents return; do not ask a subagent to reason across windows.
+- Use windows_to_open only for allowlisted semantic kinds: browser or terminal.
+- Set done true only when the original user prompt is complete, and include final_response.
+"""
+
+
+def planner_text_format() -> dict[str, Any]:
+    return {
+        "format": {
+            "type": "json_schema",
+            "name": "cua_stage_plan",
+            "strict": True,
+            "schema": PlannerPlan.model_json_schema(),
+        },
+    }
 
 
 def task_window_key(window_id: WindowTarget) -> str | None:
@@ -181,6 +275,60 @@ def latest_screenshots_for_progress(
     ]
 
 
+def parse_planner_plan(response: Any) -> PlannerPlan:
+    text = extract_final_response(response)
+    if not text:
+        raise PlannerOutputError("Planner response did not contain JSON text.")
+    try:
+        return PlannerPlan.model_validate_json(text)
+    except ValidationError as error:
+        raise PlannerOutputError(f"Planner response did not match schema: {error}") from error
+
+
+def validate_planner_plan(
+    plan: PlannerPlan,
+    windows: Iterable[WindowInfo],
+    *,
+    max_assignments: int,
+) -> None:
+    if max_assignments < 1:
+        raise PlannerOutputError("At least one subagent is required.")
+    if plan.done:
+        return
+
+    if len(plan.assignments) > max_assignments:
+        raise PlannerOutputError(
+            f"Planner assigned {len(plan.assignments)} windows, but only {max_assignments} subagents are available.",
+        )
+
+    seen_open_requests: set[str] = set()
+    for request in plan.windows_to_open:
+        if request.logical_id in seen_open_requests:
+            raise PlannerOutputError(f"Duplicate windows_to_open logical_id: {request.logical_id}")
+        seen_open_requests.add(request.logical_id)
+        if request.kind not in ALLOWED_WINDOW_OPEN_COMMANDS:
+            raise PlannerOutputError(f"Unsupported window kind: {request.kind}")
+
+    known_windows = {window.logical_id for window in windows}
+    seen_assignments: set[str] = set()
+    for assignment in plan.assignments:
+        if assignment.window in seen_assignments:
+            raise PlannerOutputError(f"Duplicate assignment for window: {assignment.window}")
+        seen_assignments.add(assignment.window)
+        if assignment.window not in known_windows:
+            raise PlannerOutputError(f"Assignment references unknown window: {assignment.window}")
+
+    if not plan.windows_to_open and not plan.assignments:
+        raise PlannerOutputError("Planner must either finish, open a window, or assign subtasks.")
+
+
+def window_assignments_by_logical(windows: Iterable[WindowInfo]) -> dict[str, WindowAssignment]:
+    return {
+        window.logical_id: window_assignment_from_info(window)
+        for window in windows
+    }
+
+
 SubagentInvoker = Callable[
     [WindowTarget, str],
     StageResult | Awaitable[StageResult],
@@ -197,6 +345,10 @@ class PooledSubagent:
 class ComputerUseSubagentPool:
     def __init__(self, subagents: Iterable[PooledSubagent]) -> None:
         self._subagents = list(subagents)
+
+    @property
+    def capacity(self) -> int:
+        return len(self._subagents)
 
     async def invoke(self, window_id: WindowTarget, prompt: str) -> StageResult:
         subagent = self._available_subagent()
@@ -960,6 +1112,129 @@ def screenshot_input(data: bytes) -> dict[str, Any]:
     }
 
 
+def input_image(data: bytes) -> dict[str, Any]:
+    return {
+        "type": "input_image",
+        "image_url": "data:image/png;base64,"
+        + base64.b64encode(data).decode("ascii"),
+        "detail": "original",
+    }
+
+
+def format_window_registry(windows: Iterable[WindowInfo]) -> str:
+    return json.dumps(to_plain(list(windows)), indent=2, sort_keys=True)
+
+
+def screenshot_artifact_bytes(
+    recorder: TrajectoryRecorder,
+    artifact: dict[str, Any],
+) -> bytes | None:
+    path = artifact.get("path")
+    if not path:
+        return None
+    screenshot_path = recorder.run_dir / str(path)
+    try:
+        return screenshot_path.read_bytes()
+    except OSError:
+        return None
+
+
+def latest_screenshots_for_windows(
+    windows: Iterable[WindowInfo],
+    screenshots: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    latest = latest_screenshots_by_window(screenshots)
+    return [
+        latest[window.logical_id]
+        for window in windows
+        if window.logical_id in latest
+    ]
+
+
+def build_planner_input(
+    *,
+    progress: TaskProgress,
+    windows: list[WindowInfo],
+    recorder: TrajectoryRecorder,
+    subagent_capacity: int,
+    feedback: str = "",
+) -> list[dict[str, Any]]:
+    latest_screenshots = latest_screenshots_for_windows(windows, recorder.screenshots)
+    screenshot_lines = [
+        f"- {artifact.get('window')}: {artifact.get('path')}"
+        for artifact in latest_screenshots
+    ]
+    text_parts = [
+        build_planner_prompt(progress),
+        f"Available subagents for this stage: {subagent_capacity}",
+        "Latest window registry:\n" + format_window_registry(windows),
+        "Latest screenshots:\n"
+        + ("\n".join(screenshot_lines) if screenshot_lines else "No screenshots available."),
+    ]
+    if feedback:
+        text_parts.append(f"Previous planner output was invalid:\n{feedback}")
+
+    content: list[dict[str, Any]] = [
+        {"type": "input_text", "text": "\n\n".join(text_parts)},
+    ]
+    for artifact in latest_screenshots:
+        image = screenshot_artifact_bytes(recorder, artifact)
+        if image is not None:
+            content.append(
+                {
+                    "type": "input_text",
+                    "text": f"Screenshot for {artifact.get('window')}: {artifact.get('path')}",
+                },
+            )
+            content.append(input_image(image))
+
+    return [{"role": "user", "content": content}]
+
+
+async def request_planner_plan(
+    *,
+    client: Any,
+    model: str,
+    progress: TaskProgress,
+    windows: list[WindowInfo],
+    recorder: TrajectoryRecorder,
+    subagent_capacity: int,
+    stage: int,
+    max_retries: int = DEFAULT_PLANNER_RETRIES,
+) -> PlannerPlan:
+    feedback = ""
+    last_error: PlannerOutputError | None = None
+    for attempt in range(1, max_retries + 2):
+        response = await asyncio.to_thread(
+            client.responses.create,
+            model=model,
+            instructions=PLANNER_GUIDELINES,
+            input=build_planner_input(
+                progress=progress,
+                windows=windows,
+                recorder=recorder,
+                subagent_capacity=subagent_capacity,
+                feedback=feedback,
+            ),
+            text=planner_text_format(),
+            truncation="auto",
+        )
+        recorder.record_response(stage * 100 + attempt, response)
+        try:
+            plan = parse_planner_plan(response)
+            validate_planner_plan(
+                plan,
+                windows,
+                max_assignments=subagent_capacity,
+            )
+            return plan
+        except PlannerOutputError as error:
+            last_error = error
+            feedback = str(error)
+    assert last_error is not None
+    raise last_error
+
+
 async def computer_use_loop_async(
     *,
     client: Any,
@@ -1177,6 +1452,283 @@ def run_computer_use_task(
     )
 
 
+async def refresh_window_registry(
+    *,
+    vm: VM,
+    recorder: TrajectoryRecorder,
+    label: str,
+) -> list[WindowInfo]:
+    windows = await asyncio.to_thread(list_windows, vm)
+    recorder.record_window_snapshot(label, windows)
+    return windows
+
+
+async def capture_registry_screenshots(
+    *,
+    arbiter: InputArbiter,
+    recorder: TrajectoryRecorder,
+    windows: Iterable[WindowInfo],
+    label: str,
+    call_id: str,
+) -> None:
+    for window in windows:
+        assignment = window_assignment_from_info(window)
+        try:
+            screenshot = await arbiter.screenshot(window_id=assignment)
+        except Exception:
+            continue
+        recorder.record_screenshot(
+            f"{label}-{window.logical_id}",
+            screenshot,
+            call_id=call_id,
+            window_id=assignment,
+        )
+
+
+def open_planned_windows(
+    *,
+    vm: VM,
+    requests: list[PlannerWindowRequest],
+) -> None:
+    for request in requests:
+        command = ALLOWED_WINDOW_OPEN_COMMANDS.get(request.kind)
+        if command is None:
+            raise PlannerOutputError(f"Unsupported window kind: {request.kind}")
+        vm.exec(f"{display_prefix(vm)} {command} >/dev/null 2>&1 &")
+
+
+def resolve_planner_assignments(
+    plan: PlannerPlan,
+    windows: Iterable[WindowInfo],
+) -> list[tuple[WindowAssignment, list[str]]]:
+    available = window_assignments_by_logical(windows)
+    resolved: list[tuple[WindowAssignment, list[str]]] = []
+    seen_window_ids: set[int] = set()
+
+    for assignment in plan.assignments:
+        window = available.get(assignment.window)
+        if window is None:
+            raise PlannerOutputError(f"Assignment references unknown window: {assignment.window}")
+        normalized = normalize_window_id(window.window_id)
+        if normalized in seen_window_ids:
+            raise PlannerOutputError(f"Multiple assignments resolved to window id: {window.window_id}")
+        seen_window_ids.add(normalized)
+        resolved.append((window, assignment.subtasks))
+
+    return resolved
+
+
+def format_subagent_prompt(
+    *,
+    original_prompt: str,
+    stage: int,
+    window: WindowAssignment,
+    subtasks: list[str],
+) -> str:
+    lines = [
+        "You are a computer-use subagent in a staged multi-window task.",
+        f"Original user task: {original_prompt}",
+        f"Stage: {stage}",
+        f"Assigned window: {window.logical_id} ({window.window_id})",
+        "Work only in this assigned window. Do not reason across windows.",
+        "Complete these subtasks in order:",
+    ]
+    lines.extend(f"{index}. {subtask}" for index, subtask in enumerate(subtasks, start=1))
+    lines.append(
+        "Finish with a concise report of what you did, steps taken, and any blocker.",
+    )
+    return "\n".join(lines)
+
+
+def make_computer_use_subagent_pool(
+    *,
+    client: Any,
+    vm: VM,
+    model: str,
+    max_turns: int,
+    output_root: Path,
+    arbiter: InputArbiter,
+    count: int,
+) -> ComputerUseSubagentPool:
+    if count < 1:
+        raise ValueError("subagent count must be at least 1")
+
+    async def invoke(window_id: WindowTarget, prompt: str) -> StageResult:
+        response, sub_recorder = await run_computer_use_task_async(
+            client=client,
+            prompt=prompt,
+            vm=vm,
+            model=model,
+            max_turns=max_turns,
+            output_root=output_root,
+            window_id=window_id,
+            arbiter=arbiter,
+        )
+        final_text = extract_final_response(response)
+        return StageResult(
+            what_they_did=final_text,
+            steps_taken=f"Completed CUA run. Artifacts: {sub_recorder.run_dir}",
+            failure_reason="",
+        )
+
+    return ComputerUseSubagentPool(
+        PooledSubagent(name=f"worker-{index}", invoke=invoke)
+        for index in range(1, count + 1)
+    )
+
+
+async def run_orchestrated_computer_use_task_async(
+    *,
+    client: Any,
+    prompt: str,
+    vm: VM,
+    model: str = DEFAULT_MODEL,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    max_stages: int = DEFAULT_MAX_STAGES,
+    output_root: Path = Path(DEFAULT_OUTPUT_DIR),
+    subagent_count: int = DEFAULT_SUBAGENTS,
+    pool: ComputerUseSubagentPool | None = None,
+    arbiter: InputArbiter | None = None,
+    planner_max_retries: int = DEFAULT_PLANNER_RETRIES,
+) -> tuple[str, TrajectoryRecorder]:
+    recorder = TrajectoryRecorder(output_root, prompt=prompt, model=model, vm=vm)
+    progress = TaskProgress(original_prompt=prompt)
+    owns_arbiter = arbiter is None
+    if arbiter is None:
+        arbiter = InputArbiter(vm)
+    arbiter.start()
+
+    if pool is None:
+        pool = make_computer_use_subagent_pool(
+            client=client,
+            vm=vm,
+            model=model,
+            max_turns=max_turns,
+            output_root=output_root,
+            arbiter=arbiter,
+            count=subagent_count,
+        )
+
+    try:
+        windows = await refresh_window_registry(
+            vm=vm,
+            recorder=recorder,
+            label="orchestration-start",
+        )
+        await capture_registry_screenshots(
+            arbiter=arbiter,
+            recorder=recorder,
+            windows=windows,
+            label="000-initial",
+            call_id="orchestrator-stage-000",
+        )
+
+        for stage in range(1, max_stages + 1):
+            plan = await request_planner_plan(
+                client=client,
+                model=model,
+                progress=progress,
+                windows=windows,
+                recorder=recorder,
+                subagent_capacity=pool.capacity,
+                stage=stage,
+                max_retries=planner_max_retries,
+            )
+
+            if plan.done:
+                recorder.finish("completed", final_response=plan.final_response)
+                return plan.final_response, recorder
+
+            if plan.windows_to_open:
+                open_planned_windows(
+                    vm=vm,
+                    requests=plan.windows_to_open,
+                )
+                windows = await refresh_window_registry(
+                    vm=vm,
+                    recorder=recorder,
+                    label=f"stage-{stage:03d}-after-window-open-requests",
+                )
+
+            assignments = resolve_planner_assignments(plan, windows)
+            if not assignments:
+                await capture_registry_screenshots(
+                    arbiter=arbiter,
+                    recorder=recorder,
+                    windows=windows,
+                    label=f"{stage:03d}-after-open-only",
+                    call_id=f"orchestrator-stage-{stage:03d}",
+                )
+                continue
+
+            results = await asyncio.gather(
+                *[
+                    pool.invoke(
+                        window,
+                        format_subagent_prompt(
+                            original_prompt=prompt,
+                            stage=stage,
+                            window=window,
+                            subtasks=subtasks,
+                        ),
+                    )
+                    for window, subtasks in assignments
+                ],
+            )
+
+            for (window, _subtasks), result in zip(assignments, results):
+                append_stage_result(progress, window, result)
+
+            windows = await refresh_window_registry(
+                vm=vm,
+                recorder=recorder,
+                label=f"stage-{stage:03d}-after-subagents",
+            )
+            await capture_registry_screenshots(
+                arbiter=arbiter,
+                recorder=recorder,
+                windows=windows,
+                label=f"{stage:03d}-after-subagents",
+                call_id=f"orchestrator-stage-{stage:03d}",
+            )
+
+        message = f"Orchestration exhausted the configured {max_stages}-stage budget."
+        recorder.finish("failed", error=message)
+        raise RuntimeError(message)
+    except Exception as error:
+        if recorder.trajectory["status"] == "running":
+            recorder.finish("failed", error=str(error))
+        raise
+    finally:
+        if owns_arbiter:
+            await arbiter.stop()
+
+
+def run_orchestrated_computer_use_task(
+    *,
+    client: Any,
+    prompt: str,
+    vm: VM,
+    model: str = DEFAULT_MODEL,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    max_stages: int = DEFAULT_MAX_STAGES,
+    output_root: Path = Path(DEFAULT_OUTPUT_DIR),
+    subagent_count: int = DEFAULT_SUBAGENTS,
+) -> tuple[str, TrajectoryRecorder]:
+    return asyncio.run(
+        run_orchestrated_computer_use_task_async(
+            client=client,
+            prompt=prompt,
+            vm=vm,
+            model=model,
+            max_turns=max_turns,
+            max_stages=max_stages,
+            output_root=output_root,
+            subagent_count=subagent_count,
+        ),
+    )
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a Docker-backed OpenAI computer-use loop.")
     parser.add_argument("--prompt", help="Task prompt to send to the computer-use model.")
@@ -1185,7 +1737,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--list-windows", action="store_true", help="Print the current X11 window registry as JSON.")
     parser.add_argument("--model", default=os.environ.get("CUA_MODEL", DEFAULT_MODEL), help="OpenAI model.")
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS, help="Maximum Responses turns.")
+    parser.add_argument("--max-stages", type=int, default=DEFAULT_MAX_STAGES, help="Maximum orchestrated planner stages.")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory for trajectory artifacts.")
+    parser.add_argument("--orchestrate", action="store_true", help="Use the staged multi-subagent orchestration loop.")
+    parser.add_argument("--subagents", type=int, default=DEFAULT_SUBAGENTS, help="Number of subagents for --orchestrate.")
     parser.add_argument("--window-id", default=None, help="Optional X11 window id to target for actions and screenshots.")
     return parser.parse_args(argv)
 
@@ -1232,15 +1787,29 @@ def main(argv: list[str] | None = None) -> int:
     client = make_openai_client()
 
     try:
-        final_response, recorder = run_computer_use_task(
-            client=client,
-            prompt=args.prompt,
-            vm=vm,
-            model=args.model,
-            max_turns=args.max_turns,
-            output_root=Path(args.output_dir),
-            window_id=window_assignment,
-        )
+        if args.orchestrate:
+            final_response, recorder = run_orchestrated_computer_use_task(
+                client=client,
+                prompt=args.prompt,
+                vm=vm,
+                model=args.model,
+                max_turns=args.max_turns,
+                max_stages=args.max_stages,
+                output_root=Path(args.output_dir),
+                subagent_count=args.subagents,
+            )
+            final_text = final_response
+        else:
+            final_response, recorder = run_computer_use_task(
+                client=client,
+                prompt=args.prompt,
+                vm=vm,
+                model=args.model,
+                max_turns=args.max_turns,
+                output_root=Path(args.output_dir),
+                window_id=window_assignment,
+            )
+            final_text = extract_final_response(final_response)
     except SafetyCheckRequired as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -1248,7 +1817,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Computer-use run failed: {error}", file=sys.stderr)
         return 1
 
-    final_text = extract_final_response(final_response)
     print(f"Run artifacts: {recorder.run_dir}")
     if final_text:
         print(final_text)

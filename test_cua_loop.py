@@ -10,6 +10,10 @@ import cua_loop
 from cua_loop import (
     ComputerUseSubagentPool,
     InputArbiter,
+    PlannerAssignment,
+    PlannerOutputError,
+    PlannerPlan,
+    PlannerWindowRequest,
     PooledSubagent,
     SafetyCheckRequired,
     StageResult,
@@ -25,7 +29,10 @@ from cua_loop import (
     latest_screenshots_for_progress,
     list_windows,
     normalize_window_id,
+    open_planned_windows,
     run_computer_use_task,
+    run_orchestrated_computer_use_task_async,
+    validate_planner_plan,
 )
 
 
@@ -66,6 +73,10 @@ def final_response(text="Done."):
             },
         ],
     }
+
+
+def planner_response(payload):
+    return final_response(json.dumps(payload))
 
 
 def make_vm(commands, *, fail_on: str | None = None, responses=None):
@@ -172,7 +183,7 @@ def test_task_progress_ledger_groups_stage_results_by_window():
         ],
     )
     prompt = build_planner_prompt(progress)
-    assert "TODO: central planner guidelines placeholder." in prompt
+    assert "You are the central planner" in prompt
     assert "Original prompt:\nPrepare the report." in prompt
     assert "Progress ledger:\n## firefox_1" in prompt
 
@@ -228,6 +239,302 @@ def test_subagent_pool_invokes_same_agent_with_different_windows():
     assert invocations == [(first_assignment, "paint"), (second_assignment, "terminal")]
     assert first.what_they_did == "Handled paint"
     assert second.steps_taken == "Used 0x456"
+
+
+def test_planner_plan_validation_accepts_known_windows_and_open_requests():
+    windows = _parse_wmctrl_lpxg(WMCTRL_SAMPLE)
+    plan = PlannerPlan(
+        done=False,
+        final_response="",
+        windows_to_open=[
+            PlannerWindowRequest(logical_id="browser_alias", kind="browser", reason="Need a page."),
+        ],
+        assignments=[
+            PlannerAssignment(window="firefox_1", subtasks=["Inspect the current tab."]),
+        ],
+    )
+
+    validate_planner_plan(plan, windows, max_assignments=1)
+
+
+def test_planner_plan_model_rejects_invalid_kind_and_done_shape():
+    with pytest.raises(ValueError, match="browser|terminal"):
+        PlannerPlan(
+            done=False,
+            final_response="",
+            windows_to_open=[
+                {"logical_id": "tool_1", "kind": "spreadsheet", "reason": "Need sheets."},
+            ],
+            assignments=[],
+        )
+
+    with pytest.raises(ValueError, match="final_response"):
+        PlannerPlan(
+            done=True,
+            final_response="",
+            windows_to_open=[],
+            assignments=[],
+        )
+
+
+@pytest.mark.parametrize(
+    ("plan", "capacity", "message"),
+    [
+        (
+            PlannerPlan(
+                done=False,
+                final_response="",
+                windows_to_open=[],
+                assignments=[PlannerAssignment(window="missing_1", subtasks=["Look."])],
+            ),
+            1,
+            "unknown window",
+        ),
+        (
+            PlannerPlan(
+                done=False,
+                final_response="",
+                windows_to_open=[],
+                assignments=[
+                    PlannerAssignment(window="firefox_1", subtasks=["Look."]),
+                    PlannerAssignment(window="firefox_1", subtasks=["Look again."]),
+                ],
+            ),
+            2,
+            "Duplicate assignment",
+        ),
+        (
+            PlannerPlan(
+                done=False,
+                final_response="",
+                windows_to_open=[],
+                assignments=[
+                    PlannerAssignment(window="firefox_1", subtasks=["Look."]),
+                    PlannerAssignment(window="xfce4_terminal_1", subtasks=["List files."]),
+                ],
+            ),
+            1,
+            "only 1 subagents",
+        ),
+    ],
+)
+def test_planner_plan_validation_rejects_invalid_stage_shapes(plan, capacity, message):
+    windows = _parse_wmctrl_lpxg(WMCTRL_SAMPLE)
+
+    with pytest.raises(PlannerOutputError, match=message):
+        validate_planner_plan(plan, windows, max_assignments=capacity)
+
+
+def test_open_planned_windows_only_launches_allowlisted_command():
+    commands = []
+    vm = make_vm(commands, responses=registry_responses())
+
+    open_planned_windows(
+        vm=vm,
+        requests=[
+            PlannerWindowRequest(
+                logical_id="terminal_alias",
+                kind="terminal",
+                reason="Need shell.",
+            ),
+        ],
+    )
+
+    assert any("DISPLAY=:99 xfce4-terminal" in command for command in commands)
+    assert not any("wmctrl -lpxG" in command for command in commands)
+
+
+def test_orchestration_runs_stage_in_parallel_and_refreshes_registry(tmp_path):
+    commands = []
+    subagents_done = False
+    refreshed_registry = "\n".join(
+        [
+            WMCTRL_SAMPLE,
+            "0x04100001  0 3456 80 90 500 400 editor.Editor host-a Notes",
+        ],
+    )
+
+    def registry(_cmd):
+        return refreshed_registry if subagents_done else WMCTRL_SAMPLE
+
+    vm = make_vm(commands, responses={"wmctrl -lpxG": registry})
+    client = FakeClient(
+        [
+            planner_response(
+                {
+                    "done": False,
+                    "final_response": "",
+                    "windows_to_open": [],
+                    "assignments": [
+                        {"window": "firefox_1", "subtasks": ["Read the page."]},
+                        {"window": "xfce4_terminal_1", "subtasks": ["Check files."]},
+                    ],
+                },
+            ),
+            planner_response(
+                {
+                    "done": True,
+                    "final_response": "All windows checked.",
+                    "windows_to_open": [],
+                    "assignments": [],
+                },
+            ),
+        ],
+    )
+    started = []
+
+    async def invoke(window_id, prompt):
+        nonlocal subagents_done
+        started.append((window_id.logical_id, prompt))
+        if len(started) == 2:
+            subagents_done = True
+        while len(started) < 2:
+            await asyncio.sleep(0)
+        return StageResult(
+            what_they_did=f"Handled {window_id.logical_id}",
+            steps_taken=f"Prompt included {window_id.logical_id}: {window_id.logical_id in prompt}",
+            failure_reason="",
+        )
+
+    pool = ComputerUseSubagentPool(
+        [
+            PooledSubagent("worker-1", invoke),
+            PooledSubagent("worker-2", invoke),
+        ],
+    )
+
+    async def run():
+        return await run_orchestrated_computer_use_task_async(
+            client=client,
+            prompt="Inspect the browser and terminal.",
+            vm=vm,
+            model="test-model",
+            output_root=tmp_path,
+            pool=pool,
+            planner_max_retries=0,
+        )
+
+    final_text, recorder = asyncio.run(run())
+
+    assert final_text == "All windows checked."
+    assert [item[0] for item in started] == ["firefox_1", "xfce4_terminal_1"]
+    assert len(client.responses.requests) == 2
+    assert client.responses.requests[0]["text"]["format"]["type"] == "json_schema"
+    second_planner_text = client.responses.requests[1]["input"][0]["content"][0]["text"]
+    assert "Handled firefox_1" in second_planner_text
+    assert "Handled xfce4_terminal_1" in second_planner_text
+    assert "editor_1" in second_planner_text
+    assert any(
+        part["type"] == "input_image"
+        for part in client.responses.requests[1]["input"][0]["content"]
+    )
+
+    snapshots = read_jsonl(recorder.window_snapshots_path)
+    assert [snapshot["label"] for snapshot in snapshots] == [
+        "orchestration-start",
+        "stage-001-after-subagents",
+    ]
+    trajectory = read_json(recorder.trajectory_path)
+    assert trajectory["status"] == "completed"
+    assert any(item["window"] == "editor_1" for item in trajectory["screenshots"])
+
+
+def test_orchestration_refreshes_registry_after_window_open_request(tmp_path):
+    commands = []
+    opened_registry = "\n".join(
+        [
+            WMCTRL_SAMPLE,
+            "0x03d00002  0 3456 60 70 800 600 xfce4-terminal.Xfce4-terminal host-a Terminal",
+        ],
+    )
+
+    def registry(_cmd):
+        if any("xfce4-terminal" in command for command in commands):
+            return opened_registry
+        return WMCTRL_SAMPLE
+
+    vm = make_vm(commands, responses={"wmctrl -lpxG": registry})
+    client = FakeClient(
+        [
+            planner_response(
+                {
+                    "done": False,
+                    "final_response": "",
+                    "windows_to_open": [
+                        {"logical_id": "terminal_alias", "kind": "terminal", "reason": "Need shell."},
+                    ],
+                    "assignments": [],
+                },
+            ),
+            planner_response(
+                {
+                    "done": True,
+                    "final_response": "Terminal is available.",
+                    "windows_to_open": [],
+                    "assignments": [],
+                },
+            ),
+        ],
+    )
+    pool = ComputerUseSubagentPool([PooledSubagent("worker-1", lambda _window, _prompt: pytest.fail())])
+
+    async def run():
+        return await run_orchestrated_computer_use_task_async(
+            client=client,
+            prompt="Open a terminal.",
+            vm=vm,
+            model="test-model",
+            output_root=tmp_path,
+            pool=pool,
+            planner_max_retries=0,
+        )
+
+    final_text, recorder = asyncio.run(run())
+
+    assert final_text == "Terminal is available."
+    assert any("DISPLAY=:99 xfce4-terminal" in command for command in commands)
+    second_planner_text = client.responses.requests[1]["input"][0]["content"][0]["text"]
+    assert "xfce4_terminal_2" in second_planner_text
+    snapshots = read_jsonl(recorder.window_snapshots_path)
+    assert [snapshot["label"] for snapshot in snapshots] == [
+        "orchestration-start",
+        "stage-001-after-window-open-requests",
+    ]
+
+
+def test_orchestration_cli_uses_opt_in_path(monkeypatch, capsys):
+    captured = {}
+    vm = make_vm([], responses=registry_responses())
+    monkeypatch.setattr(cua_loop, "VM", lambda display, container_name: vm)
+    monkeypatch.setattr(cua_loop, "make_openai_client", lambda: object())
+
+    class Recorder:
+        run_dir = Path("run")
+
+    def fake_run_orchestrated_computer_use_task(**kwargs):
+        captured.update(kwargs)
+        return "orchestrated result", Recorder()
+
+    monkeypatch.setattr(
+        cua_loop,
+        "run_orchestrated_computer_use_task",
+        fake_run_orchestrated_computer_use_task,
+    )
+
+    result = cua_loop.main(
+        [
+            "--prompt",
+            "Inspect everything.",
+            "--orchestrate",
+            "--max-stages",
+            "7",
+        ],
+    )
+
+    assert result == 0
+    assert captured["subagent_count"] == 8
+    assert captured["max_stages"] == 7
+    assert "orchestrated result" in capsys.readouterr().out
 
 
 def test_normalize_window_id_accepts_hex_and_decimal():
