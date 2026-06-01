@@ -117,11 +117,28 @@ class PlannerOutputError(ValueError):
     pass
 
 
+WindowKind = Literal[
+    "browser",
+    "calculator",
+    "dictionary",
+    "document_viewer",
+    "email",
+    "file_manager",
+    "image_editor",
+    "image_viewer",
+    "media_player",
+    "task_manager",
+    "terminal",
+    "text_editor",
+    "word_processor",
+]
+
+
 class PlannerWindowRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     logical_id: str = Field(min_length=1)
-    kind: Literal["browser", "terminal"]
+    kind: WindowKind
     reason: str
 
     @field_validator("logical_id")
@@ -176,14 +193,25 @@ class PlannerPlan(BaseModel):
 
 ALLOWED_WINDOW_OPEN_COMMANDS: dict[str, str] = {
     "browser": "firefox-esr",
+    "calculator": "galculator",
+    "dictionary": "xfce4-dict",
+    "document_viewer": "evince",
+    "email": "thunderbird",
+    "file_manager": "thunar",
+    "image_editor": "gimp",
+    "image_viewer": "ristretto",
+    "media_player": "vlc",
+    "task_manager": "xfce4-taskmanager",
     "terminal": "xfce4-terminal",
+    "text_editor": "gedit",
+    "word_processor": "lowriter",
 }
 DEFAULT_SUBAGENTS = 8
 DEFAULT_MAX_STAGES = 20
 DEFAULT_PLANNER_RETRIES = 2
 
 
-PLANNER_GUIDELINES = """\
+PLANNER_GUIDELINES = f"""\
 You are the central planner for a pool of computer-use subagents in one Linux virtual display.
 
 Return only strict JSON matching the requested schema. Plan one stage at a time.
@@ -192,7 +220,7 @@ Return only strict JSON matching the requested schema. Plan one stage at a time.
 - Each assignment's subtasks must be independent of every other assignment in the same stage.
 - If a dependency exists between windows, serialize it by assigning only the prerequisite work in this stage.
 - Do cross-window reasoning yourself after subagents return; do not ask a subagent to reason across windows.
-- Use windows_to_open only for allowlisted semantic kinds: browser or terminal.
+- Use windows_to_open only for allowlisted semantic kinds: {", ".join(sorted(ALLOWED_WINDOW_OPEN_COMMANDS))}.
 - Set done true only when the original user prompt is complete, and include final_response.
 """
 

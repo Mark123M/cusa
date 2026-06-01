@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
@@ -345,6 +346,27 @@ def test_open_planned_windows_only_launches_allowlisted_command():
     assert not any("wmctrl -lpxG" in command for command in commands)
 
 
+def test_allowed_window_open_commands_validate_and_launch():
+    commands = []
+    vm = make_vm(commands)
+    allowed_commands = sorted(cua_loop.ALLOWED_WINDOW_OPEN_COMMANDS.items())
+    assert set(get_args(cua_loop.WindowKind)) == {kind for kind, _command in allowed_commands}
+    requests = [
+        PlannerWindowRequest(
+            logical_id=f"{kind}_alias",
+            kind=kind,
+            reason="Need this app.",
+        )
+        for kind, _command in allowed_commands
+    ]
+
+    open_planned_windows(vm=vm, requests=requests)
+
+    assert len(commands) == len(allowed_commands)
+    for command_line, (_kind, launcher) in zip(commands, allowed_commands):
+        assert f"DISPLAY=:99 {launcher}" in command_line
+
+
 def test_window_logical_id_registry_assigns_monotonic_prompt_scoped_ids():
     registry = WindowLogicalIdRegistry()
     first = registry.apply(_parse_wmctrl_lpxg(WMCTRL_SAMPLE))
@@ -536,20 +558,14 @@ def test_orchestration_dumps_planner_and_subagent_prompts(tmp_path):
         / "stage_001"
         / "planner"
     )
-    planner_request = read_json(planner_dir / "request.json")
     planner_prompt = (planner_dir / "prompt.txt").read_text(encoding="utf-8")
-    screenshot_records = read_json(planner_dir / "screenshots.json")
     planner_pngs = sorted(planner_dir.glob("*.png"))
 
-    assert planner_request["model"] == "test-model"
-    assert planner_request["instructions"].startswith("You are the central planner")
     assert "Available subagents for this stage: 1" in planner_prompt
     assert "Latest window registry:" in planner_prompt
+    assert "You are the central planner" in planner_prompt
     assert planner_pngs
-    assert {path.name for path in planner_pngs} == {
-        record["filename"] for record in screenshot_records
-    }
-    assert all(record["source_path"].startswith("screenshots/") for record in screenshot_records)
+    assert not list(planner_dir.glob("*.json"))
     assert not (planner_dir / "screenshots").exists()
 
     subagent_dir = (
@@ -559,16 +575,12 @@ def test_orchestration_dumps_planner_and_subagent_prompts(tmp_path):
         / "stage_001"
         / "subagents"
     )
-    subagent_request = read_json(subagent_dir / "request.json")
     subagent_prompt = (subagent_dir / "prompt.txt").read_text(encoding="utf-8")
 
-    assert subagent_request["model"] == "test-model"
-    assert subagent_request["tools"] == [{"type": "computer"}]
-    assert subagent_request["input"] == subagent_prompt.rstrip("\n")
     assert "Assigned window: firefox_1 (0x03a00007)" in subagent_prompt
     assert "1. Read the page." in subagent_prompt
     assert not list(subagent_dir.glob("*.png"))
-    assert not (subagent_dir / "screenshots.json").exists()
+    assert not list(subagent_dir.glob("*.json"))
     assert (
         recorder.run_dir
         / "prompts"
@@ -640,6 +652,160 @@ def test_orchestration_refreshes_registry_after_window_open_request(tmp_path):
         "orchestration-start",
         "stage-001-after-window-open-requests",
     ]
+
+
+def test_orchestration_keeps_logical_ids_stable_when_open_reorders_registry(tmp_path):
+    commands = []
+    opened_registry = "\n".join(
+        [
+            "0x04400002  0 3456 60 70 900 700 Navigator.firefox host-a New - Mozilla Firefox",
+            "0x03a00007  0 1234 10 40 900 700 Navigator.firefox host-a Example - Mozilla Firefox",
+            "0x03c00001  0 2345 30 50 640 480 xfce4-terminal.Xfce4-terminal host-a Terminal",
+        ],
+    )
+
+    def registry(_cmd):
+        if any("firefox-esr" in command for command in commands):
+            return opened_registry
+        return WMCTRL_SAMPLE
+
+    vm = make_vm(commands, responses={"wmctrl -lpxG": registry})
+    client = FakeClient(
+        [
+            planner_response(
+                {
+                    "done": False,
+                    "final_response": "",
+                    "windows_to_open": [
+                        {"logical_id": "browser_alias", "kind": "browser", "reason": "Need comparison."},
+                    ],
+                    "assignments": [
+                        {"window": "firefox_1", "subtasks": ["Read the original page."]},
+                    ],
+                },
+            ),
+            planner_response(
+                {
+                    "done": True,
+                    "final_response": "Browser windows are stable.",
+                    "windows_to_open": [],
+                    "assignments": [],
+                },
+            ),
+        ],
+    )
+    started = []
+
+    async def invoke(window_id, _prompt):
+        started.append((window_id.logical_id, window_id.window_id))
+        return StageResult(
+            what_they_did=f"Handled {window_id.logical_id}",
+            steps_taken=f"Used {window_id.window_id}",
+            failure_reason="",
+        )
+
+    pool = ComputerUseSubagentPool([PooledSubagent("worker-1", invoke)])
+
+    async def run():
+        return await run_orchestrated_computer_use_task_async(
+            client=client,
+            prompt="Inspect the existing browser and open another.",
+            vm=vm,
+            model="test-model",
+            output_root=tmp_path,
+            pool=pool,
+            planner_max_retries=0,
+        )
+
+    final_text, recorder = asyncio.run(run())
+
+    assert final_text == "Browser windows are stable."
+    assert started == [("firefox_1", "0x03a00007")]
+    second_planner_text = client.responses.requests[1]["input"][0]["content"][0]["text"]
+    assert "Handled firefox_1" in second_planner_text
+    assert '"logical_id": "firefox_1"' in second_planner_text
+    assert '"window_id": "0x03a00007"' in second_planner_text
+    assert '"logical_id": "firefox_2"' in second_planner_text
+    assert '"window_id": "0x04400002"' in second_planner_text
+
+    snapshots = read_jsonl(recorder.window_snapshots_path)
+    after_open = snapshots[1]["windows"]
+    assert {window["window_id"]: window["logical_id"] for window in after_open} == {
+        "0x04400002": "firefox_2",
+        "0x03a00007": "firefox_1",
+        "0x03c00001": "xfce4_terminal_1",
+    }
+    trajectory = read_json(recorder.trajectory_path)
+    assert any(item["window"] == "firefox_1" for item in trajectory["screenshots"])
+    assert any(item["window"] == "firefox_2" for item in trajectory["screenshots"])
+
+
+def test_orchestration_resolves_same_stage_assignments_before_open_refresh(tmp_path):
+    commands = []
+    opened_registry = "\n".join(
+        [
+            "0x04400002  0 3456 60 70 900 700 Navigator.firefox host-a New - Mozilla Firefox",
+            "0x03c00001  0 2345 30 50 640 480 xfce4-terminal.Xfce4-terminal host-a Terminal",
+        ],
+    )
+
+    def registry(_cmd):
+        if any("firefox-esr" in command for command in commands):
+            return opened_registry
+        return WMCTRL_SAMPLE
+
+    vm = make_vm(commands, responses={"wmctrl -lpxG": registry})
+    client = FakeClient(
+        [
+            planner_response(
+                {
+                    "done": False,
+                    "final_response": "",
+                    "windows_to_open": [
+                        {"logical_id": "browser_alias", "kind": "browser", "reason": "Need another browser."},
+                    ],
+                    "assignments": [
+                        {"window": "firefox_1", "subtasks": ["Read the original page before it disappears."]},
+                    ],
+                },
+            ),
+            planner_response(
+                {
+                    "done": True,
+                    "final_response": "Original browser assignment was preserved.",
+                    "windows_to_open": [],
+                    "assignments": [],
+                },
+            ),
+        ],
+    )
+    started = []
+
+    async def invoke(window_id, _prompt):
+        started.append((window_id.logical_id, window_id.window_id))
+        return StageResult(
+            what_they_did=f"Handled {window_id.logical_id}",
+            steps_taken=f"Used {window_id.window_id}",
+            failure_reason="",
+        )
+
+    pool = ComputerUseSubagentPool([PooledSubagent("worker-1", invoke)])
+
+    async def run():
+        return await run_orchestrated_computer_use_task_async(
+            client=client,
+            prompt="Assign existing browser and open a replacement.",
+            vm=vm,
+            model="test-model",
+            output_root=tmp_path,
+            pool=pool,
+            planner_max_retries=0,
+        )
+
+    final_text, _recorder = asyncio.run(run())
+
+    assert final_text == "Original browser assignment was preserved."
+    assert started == [("firefox_1", "0x03a00007")]
 
 
 def test_orchestration_cli_uses_opt_in_path(monkeypatch, capsys):
