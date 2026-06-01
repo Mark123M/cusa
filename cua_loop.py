@@ -452,6 +452,42 @@ def _logical_id_base(wm_class: str | None, title: str) -> str:
     return "window"
 
 
+def _logical_id_base_from_snapshot(logical_id: str) -> str:
+    base, separator, suffix = logical_id.rpartition("_")
+    if separator and base and suffix.isdecimal():
+        return base
+    return logical_id or "window"
+
+
+class WindowLogicalIdRegistry:
+    """Assign stable logical ids to X11 windows for one orchestrated prompt."""
+
+    def __init__(self) -> None:
+        self._logical_ids_by_window: dict[int, str] = {}
+        self._next_suffix_by_base: dict[str, int] = {}
+
+    def apply(self, windows: Iterable[WindowInfo]) -> list[WindowInfo]:
+        return [self._with_stable_logical_id(window) for window in windows]
+
+    def _with_stable_logical_id(self, window: WindowInfo) -> WindowInfo:
+        normalized_window_id = normalize_window_id(window.window_id)
+        logical_id = self._logical_ids_by_window.get(normalized_window_id)
+        if logical_id is None:
+            base = _logical_id_base_from_snapshot(window.logical_id)
+            suffix = self._next_suffix_by_base.get(base, 1)
+            logical_id = f"{base}_{suffix}"
+            self._next_suffix_by_base[base] = suffix + 1
+            self._logical_ids_by_window[normalized_window_id] = logical_id
+
+        return WindowInfo(
+            logical_id=logical_id,
+            window_id=window.window_id,
+            title=window.title,
+            pid=window.pid,
+            geometry=dict(window.geometry),
+        )
+
+
 def list_windows(vm: VM) -> list[WindowInfo]:
     raw = vm.exec(f"{display_prefix(vm)} wmctrl -lpxG")
     if isinstance(raw, bytes):
@@ -884,6 +920,7 @@ class TrajectoryRecorder:
         self.run_dir = output_root / self.run_id
         self.responses_dir = self.run_dir / "responses"
         self.screenshots_dir = self.run_dir / "screenshots"
+        self.prompts_dir = self.run_dir / "prompts"
         self.actions_path = self.run_dir / "actions.jsonl"
         self.calls_path = self.run_dir / "computer_calls.jsonl"
         self.trajectory_path = self.run_dir / "trajectory.json"
@@ -1040,6 +1077,42 @@ class TrajectoryRecorder:
         self.flush_trajectory()
         return path
 
+    def record_prompt_artifacts(
+        self,
+        *,
+        call_id: str,
+        stage: int,
+        actor: Literal["planner", "subagents"],
+        prompt_text: str,
+        screenshots: Iterable[dict[str, Any]] | None = None,
+    ) -> Path:
+        call_key = sanitize_filename(call_id)
+        artifact_dir = self.prompts_dir / call_key / f"stage_{stage:03d}" / actor
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        (artifact_dir / "prompt.txt").write_text(
+            prompt_text if prompt_text.endswith("\n") else prompt_text + "\n",
+            encoding="utf-8",
+        )
+
+        if screenshots is not None:
+            for index, artifact in enumerate(screenshots, start=1):
+                source_path = artifact.get("path")
+                if not source_path:
+                    continue
+                source = self.run_dir / str(source_path)
+                try:
+                    data = source.read_bytes()
+                except OSError:
+                    continue
+
+                source_stem = sanitize_filename(Path(str(source_path)).stem)
+                filename = f"{index:03d}-{source_stem}.png"
+                destination = artifact_dir / filename
+                destination.write_bytes(data)
+
+        return artifact_dir
+
     def record_window_snapshot(
         self,
         label: str,
@@ -1158,8 +1231,10 @@ def build_planner_input(
     recorder: TrajectoryRecorder,
     subagent_capacity: int,
     feedback: str = "",
+    latest_screenshots: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    latest_screenshots = latest_screenshots_for_windows(windows, recorder.screenshots)
+    if latest_screenshots is None:
+        latest_screenshots = latest_screenshots_for_windows(windows, recorder.screenshots)
     screenshot_lines = [
         f"- {artifact.get('window')}: {artifact.get('path')}"
         for artifact in latest_screenshots
@@ -1201,21 +1276,34 @@ async def request_planner_plan(
     subagent_capacity: int,
     stage: int,
     max_retries: int = DEFAULT_PLANNER_RETRIES,
+    dump_prompts: bool = False,
 ) -> PlannerPlan:
     feedback = ""
     last_error: PlannerOutputError | None = None
     for attempt in range(1, max_retries + 2):
+        latest_screenshots = latest_screenshots_for_windows(windows, recorder.screenshots)
+        planner_input = build_planner_input(
+            progress=progress,
+            windows=windows,
+            recorder=recorder,
+            subagent_capacity=subagent_capacity,
+            feedback=feedback,
+            latest_screenshots=latest_screenshots,
+        )
+        if dump_prompts:
+            prompt_text = str(planner_input[0]["content"][0]["text"])
+            recorder.record_prompt_artifacts(
+                call_id=f"planner-stage-{stage:03d}-attempt-{attempt:03d}",
+                stage=stage,
+                actor="planner",
+                prompt_text=prompt_text,
+                screenshots=latest_screenshots,
+            )
         response = await asyncio.to_thread(
             client.responses.create,
             model=model,
             instructions=PLANNER_GUIDELINES,
-            input=build_planner_input(
-                progress=progress,
-                windows=windows,
-                recorder=recorder,
-                subagent_capacity=subagent_capacity,
-                feedback=feedback,
-            ),
+            input=planner_input,
             text=planner_text_format(),
             truncation="auto",
         )
@@ -1457,8 +1545,11 @@ async def refresh_window_registry(
     vm: VM,
     recorder: TrajectoryRecorder,
     label: str,
+    logical_ids: WindowLogicalIdRegistry | None = None,
 ) -> list[WindowInfo]:
     windows = await asyncio.to_thread(list_windows, vm)
+    if logical_ids is not None:
+        windows = logical_ids.apply(windows)
     recorder.record_window_snapshot(label, windows)
     return windows
 
@@ -1590,6 +1681,7 @@ async def run_orchestrated_computer_use_task_async(
     pool: ComputerUseSubagentPool | None = None,
     arbiter: InputArbiter | None = None,
     planner_max_retries: int = DEFAULT_PLANNER_RETRIES,
+    dump_prompts: bool = False,
 ) -> tuple[str, TrajectoryRecorder]:
     recorder = TrajectoryRecorder(output_root, prompt=prompt, model=model, vm=vm)
     progress = TaskProgress(original_prompt=prompt)
@@ -1609,11 +1701,14 @@ async def run_orchestrated_computer_use_task_async(
             count=subagent_count,
         )
 
+    logical_ids = WindowLogicalIdRegistry()
+
     try:
         windows = await refresh_window_registry(
             vm=vm,
             recorder=recorder,
             label="orchestration-start",
+            logical_ids=logical_ids,
         )
         await capture_registry_screenshots(
             arbiter=arbiter,
@@ -1633,11 +1728,14 @@ async def run_orchestrated_computer_use_task_async(
                 subagent_capacity=pool.capacity,
                 stage=stage,
                 max_retries=planner_max_retries,
+                dump_prompts=dump_prompts,
             )
 
             if plan.done:
                 recorder.finish("completed", final_response=plan.final_response)
                 return plan.final_response, recorder
+
+            assignments = resolve_planner_assignments(plan, windows)
 
             if plan.windows_to_open:
                 open_planned_windows(
@@ -1648,9 +1746,9 @@ async def run_orchestrated_computer_use_task_async(
                     vm=vm,
                     recorder=recorder,
                     label=f"stage-{stage:03d}-after-window-open-requests",
+                    logical_ids=logical_ids,
                 )
 
-            assignments = resolve_planner_assignments(plan, windows)
             if not assignments:
                 await capture_registry_screenshots(
                     arbiter=arbiter,
@@ -1661,20 +1759,24 @@ async def run_orchestrated_computer_use_task_async(
                 )
                 continue
 
-            results = await asyncio.gather(
-                *[
-                    pool.invoke(
-                        window,
-                        format_subagent_prompt(
-                            original_prompt=prompt,
-                            stage=stage,
-                            window=window,
-                            subtasks=subtasks,
-                        ),
+            subagent_invocations = []
+            for window, subtasks in assignments:
+                subagent_prompt = format_subagent_prompt(
+                    original_prompt=prompt,
+                    stage=stage,
+                    window=window,
+                    subtasks=subtasks,
+                )
+                if dump_prompts:
+                    recorder.record_prompt_artifacts(
+                        call_id=f"subagent-stage-{stage:03d}-{window.logical_id}",
+                        stage=stage,
+                        actor="subagents",
+                        prompt_text=subagent_prompt,
                     )
-                    for window, subtasks in assignments
-                ],
-            )
+                subagent_invocations.append(pool.invoke(window, subagent_prompt))
+
+            results = await asyncio.gather(*subagent_invocations)
 
             for (window, _subtasks), result in zip(assignments, results):
                 append_stage_result(progress, window, result)
@@ -1683,6 +1785,7 @@ async def run_orchestrated_computer_use_task_async(
                 vm=vm,
                 recorder=recorder,
                 label=f"stage-{stage:03d}-after-subagents",
+                logical_ids=logical_ids,
             )
             await capture_registry_screenshots(
                 arbiter=arbiter,
@@ -1714,6 +1817,7 @@ def run_orchestrated_computer_use_task(
     max_stages: int = DEFAULT_MAX_STAGES,
     output_root: Path = Path(DEFAULT_OUTPUT_DIR),
     subagent_count: int = DEFAULT_SUBAGENTS,
+    dump_prompts: bool = False,
 ) -> tuple[str, TrajectoryRecorder]:
     return asyncio.run(
         run_orchestrated_computer_use_task_async(
@@ -1725,6 +1829,7 @@ def run_orchestrated_computer_use_task(
             max_stages=max_stages,
             output_root=output_root,
             subagent_count=subagent_count,
+            dump_prompts=dump_prompts,
         ),
     )
 
@@ -1741,6 +1846,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory for trajectory artifacts.")
     parser.add_argument("--orchestrate", action="store_true", help="Use the staged multi-subagent orchestration loop.")
     parser.add_argument("--subagents", type=int, default=DEFAULT_SUBAGENTS, help="Number of subagents for --orchestrate.")
+    parser.add_argument(
+        "--dump-prompts",
+        action="store_true",
+        help="Dump orchestrated planner and subagent prompt artifacts under the run directory.",
+    )
     parser.add_argument("--window-id", default=None, help="Optional X11 window id to target for actions and screenshots.")
     return parser.parse_args(argv)
 
@@ -1797,6 +1907,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_stages=args.max_stages,
                 output_root=Path(args.output_dir),
                 subagent_count=args.subagents,
+                dump_prompts=args.dump_prompts,
             )
             final_text = final_response
         else:

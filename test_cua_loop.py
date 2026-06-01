@@ -21,6 +21,7 @@ from cua_loop import (
     TaskProgress,
     VM,
     WindowAssignment,
+    WindowLogicalIdRegistry,
     _parse_wmctrl_lpxg,
     append_stage_result,
     build_planner_prompt,
@@ -344,6 +345,44 @@ def test_open_planned_windows_only_launches_allowlisted_command():
     assert not any("wmctrl -lpxG" in command for command in commands)
 
 
+def test_window_logical_id_registry_assigns_monotonic_prompt_scoped_ids():
+    registry = WindowLogicalIdRegistry()
+    first = registry.apply(_parse_wmctrl_lpxg(WMCTRL_SAMPLE))
+
+    assert [(window.window_id, window.logical_id) for window in first] == [
+        ("0x03a00007", "firefox_1"),
+        ("0x03c00001", "xfce4_terminal_1"),
+    ]
+
+    reordered = registry.apply(
+        _parse_wmctrl_lpxg(
+            "\n".join(
+                [
+                    "0x04400002  0 3456 60 70 900 700 Navigator.firefox host-a New - Mozilla Firefox",
+                    "0x03a00007  0 1234 10 40 900 700 Navigator.firefox host-a Example - Mozilla Firefox",
+                    "0x03c00001  0 2345 30 50 640 480 xfce4-terminal.Xfce4-terminal host-a Terminal",
+                ],
+            ),
+        ),
+    )
+
+    assert [(window.window_id, window.logical_id) for window in reordered] == [
+        ("0x04400002", "firefox_2"),
+        ("0x03a00007", "firefox_1"),
+        ("0x03c00001", "xfce4_terminal_1"),
+    ]
+
+    after_close = registry.apply(
+        _parse_wmctrl_lpxg(
+            "0x04400002  0 3456 60 70 900 700 Navigator.firefox host-a New - Mozilla Firefox",
+        ),
+    )
+
+    assert [(window.window_id, window.logical_id) for window in after_close] == [
+        ("0x04400002", "firefox_2"),
+    ]
+
+
 def test_orchestration_runs_stage_in_parallel_and_refreshes_registry(tmp_path):
     commands = []
     subagents_done = False
@@ -437,6 +476,107 @@ def test_orchestration_runs_stage_in_parallel_and_refreshes_registry(tmp_path):
     trajectory = read_json(recorder.trajectory_path)
     assert trajectory["status"] == "completed"
     assert any(item["window"] == "editor_1" for item in trajectory["screenshots"])
+    assert not (recorder.run_dir / "prompts").exists()
+
+
+def test_orchestration_dumps_planner_and_subagent_prompts(tmp_path):
+    commands = []
+    vm = make_vm(commands, responses=registry_responses())
+    client = FakeClient(
+        [
+            planner_response(
+                {
+                    "done": False,
+                    "final_response": "",
+                    "windows_to_open": [],
+                    "assignments": [
+                        {"window": "firefox_1", "subtasks": ["Read the page."]},
+                    ],
+                },
+            ),
+            planner_response(
+                {
+                    "done": True,
+                    "final_response": "Firefox checked.",
+                    "windows_to_open": [],
+                    "assignments": [],
+                },
+            ),
+        ],
+    )
+
+    async def invoke(window_id, prompt):
+        return StageResult(
+            what_they_did=f"Handled {window_id.logical_id}",
+            steps_taken=f"Prompt included task: {'Read the page.' in prompt}",
+            failure_reason="",
+        )
+
+    pool = ComputerUseSubagentPool([PooledSubagent("worker-1", invoke)])
+
+    async def run():
+        return await run_orchestrated_computer_use_task_async(
+            client=client,
+            prompt="Inspect Firefox.",
+            vm=vm,
+            model="test-model",
+            output_root=tmp_path,
+            pool=pool,
+            planner_max_retries=0,
+            dump_prompts=True,
+        )
+
+    final_text, recorder = asyncio.run(run())
+
+    assert final_text == "Firefox checked."
+    planner_dir = (
+        recorder.run_dir
+        / "prompts"
+        / "planner-stage-001-attempt-001"
+        / "stage_001"
+        / "planner"
+    )
+    planner_request = read_json(planner_dir / "request.json")
+    planner_prompt = (planner_dir / "prompt.txt").read_text(encoding="utf-8")
+    screenshot_records = read_json(planner_dir / "screenshots.json")
+    planner_pngs = sorted(planner_dir.glob("*.png"))
+
+    assert planner_request["model"] == "test-model"
+    assert planner_request["instructions"].startswith("You are the central planner")
+    assert "Available subagents for this stage: 1" in planner_prompt
+    assert "Latest window registry:" in planner_prompt
+    assert planner_pngs
+    assert {path.name for path in planner_pngs} == {
+        record["filename"] for record in screenshot_records
+    }
+    assert all(record["source_path"].startswith("screenshots/") for record in screenshot_records)
+    assert not (planner_dir / "screenshots").exists()
+
+    subagent_dir = (
+        recorder.run_dir
+        / "prompts"
+        / "subagent-stage-001-firefox_1"
+        / "stage_001"
+        / "subagents"
+    )
+    subagent_request = read_json(subagent_dir / "request.json")
+    subagent_prompt = (subagent_dir / "prompt.txt").read_text(encoding="utf-8")
+
+    assert subagent_request["model"] == "test-model"
+    assert subagent_request["tools"] == [{"type": "computer"}]
+    assert subagent_request["input"] == subagent_prompt.rstrip("\n")
+    assert "Assigned window: firefox_1 (0x03a00007)" in subagent_prompt
+    assert "1. Read the page." in subagent_prompt
+    assert not list(subagent_dir.glob("*.png"))
+    assert not (subagent_dir / "screenshots.json").exists()
+    assert (
+        recorder.run_dir
+        / "prompts"
+        / "planner-stage-002-attempt-001"
+        / "stage_002"
+        / "planner"
+        / "prompt.txt"
+    ).exists()
 
 
 def test_orchestration_refreshes_registry_after_window_open_request(tmp_path):
@@ -526,6 +666,7 @@ def test_orchestration_cli_uses_opt_in_path(monkeypatch, capsys):
             "--prompt",
             "Inspect everything.",
             "--orchestrate",
+            "--dump-prompts",
             "--max-stages",
             "7",
         ],
@@ -534,6 +675,7 @@ def test_orchestration_cli_uses_opt_in_path(monkeypatch, capsys):
     assert result == 0
     assert captured["subagent_count"] == 8
     assert captured["max_stages"] == 7
+    assert captured["dump_prompts"] is True
     assert "orchestrated result" in capsys.readouterr().out
 
 
