@@ -25,6 +25,23 @@ DEFAULT_DISPLAY = ":99"
 DEFAULT_MAX_TURNS = 50
 DEFAULT_MODEL = "gpt-5.5"
 DEFAULT_OUTPUT_DIR = "cua-runs"
+SCREENSHOT_CAPTURE_TIMEOUT_SECONDS = 2
+CLIPBOARD_TYPE_CHAR_THRESHOLD = 200
+OWNED_POPUP_WINDOW_TYPES = {
+    "_NET_WM_WINDOW_TYPE_COMBO",
+    "_NET_WM_WINDOW_TYPE_DIALOG",
+    "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
+    "_NET_WM_WINDOW_TYPE_MENU",
+    "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+    "_NET_WM_WINDOW_TYPE_POPUP_MENU",
+    "_NET_WM_WINDOW_TYPE_SPLASH",
+    "_NET_WM_WINDOW_TYPE_TOOLTIP",
+    "_NET_WM_WINDOW_TYPE_UTILITY",
+}
+XPROP_POPUP_PROPERTIES = (
+    "WM_TRANSIENT_FOR",
+    "_NET_WM_WINDOW_TYPE",
+)
 
 
 class SafetyCheckRequired(RuntimeError):
@@ -553,6 +570,87 @@ def find_window_assignment(
     return window_assignment_from_info(window)
 
 
+def window_xprop(vm: VM, window_id: str) -> str:
+    raw = vm.exec(
+        f"{display_prefix(vm)} xprop -id {shell_quote(window_id)} "
+        + " ".join(XPROP_POPUP_PROPERTIES),
+    )
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw)
+
+
+def xprop_transient_for(output: str) -> int | None:
+    match = re.search(r"WM_TRANSIENT_FOR\(WINDOW\):\s+window id #\s+(\S+)", output)
+    if not match:
+        return None
+    try:
+        return normalize_window_id(match.group(1))
+    except ValueError:
+        return None
+
+
+def xprop_window_types(output: str) -> set[str]:
+    return set(re.findall(r"_NET_WM_WINDOW_TYPE_[A-Z0-9_]+", output))
+
+
+def active_window_is_owned_popup(
+    vm: VM,
+    assignment: WindowAssignment,
+    active_window: WindowInfo,
+) -> bool:
+    if active_window.pid != assignment.pid:
+        return False
+
+    try:
+        properties = window_xprop(vm, active_window.window_id)
+    except Exception:
+        properties = ""
+
+    transient_for = xprop_transient_for(properties)
+    if transient_for == normalize_window_id(assignment.window_id):
+        return True
+
+    return bool(xprop_window_types(properties) & OWNED_POPUP_WINDOW_TYPES)
+
+
+def active_owned_modal_window(vm: VM, assignment: WindowTarget) -> WindowAssignment | None:
+    if not isinstance(assignment, WindowAssignment) or assignment.pid is None:
+        return None
+    try:
+        active = vm.exec(f"{display_prefix(vm)} xdotool getactivewindow")
+        if isinstance(active, bytes):
+            active = active.decode("utf-8", errors="replace")
+        active_id = normalize_window_id(active)
+        expected_id = normalize_window_id(assignment.window_id)
+    except Exception:
+        return None
+
+    if active_id == expected_id:
+        return None
+
+    try:
+        windows = list_windows(vm)
+        active_window = find_window_info(windows, active_id)
+    except Exception:
+        return None
+    if active_window is None:
+        return None
+    if not active_window_is_owned_popup(vm, assignment, active_window):
+        return None
+    return window_assignment_from_info(active_window)
+
+
+def window_present(vm: VM, window_id: WindowTarget) -> bool:
+    resolved = target_window_id(window_id)
+    if not resolved:
+        return True
+    try:
+        return find_window_info(list_windows(vm), resolved) is not None
+    except Exception:
+        return True
+
+
 def validate_window_assignment(
     vm: VM,
     assignment: WindowAssignment,
@@ -818,7 +916,7 @@ def ensure_target_window_is_active(vm: VM, window_id: WindowTarget) -> None:
             logical_id=target_logical_id(window_id),
             reason=f"active-window check failed: {error}",
         ) from error
-    if active_id != expected_id:
+    if active_id != expected_id and active_owned_modal_window(vm, window_id) is None:
         raise StaleWindowError(
             resolved,
             logical_id=target_logical_id(window_id),
@@ -836,6 +934,25 @@ def mousemove_command(vm: VM, x: int, y: int, window_id: WindowTarget) -> str:
     return f"{display_prefix(vm)} xdotool mousemove {x} {y}"
 
 
+def should_use_clipboard_type(text: str) -> bool:
+    return "\n" in text or len(text) > CLIPBOARD_TYPE_CHAR_THRESHOLD
+
+
+def type_text(vm: VM, text: str) -> None:
+    if should_use_clipboard_type(text):
+        try:
+            vm.exec("command -v xclip >/dev/null")
+            vm.exec(
+                f"(printf %s {shell_quote(text)} | "
+                f"{display_prefix(vm)} timeout 5s xclip -selection clipboard -loops 1) "
+                f">/dev/null 2>&1 & sleep 0.1; {display_prefix(vm)} xdotool key ctrl+v",
+            )
+            return
+        except Exception:
+            pass
+    vm.exec(f"{display_prefix(vm)} xdotool type --delay 0 -- {shell_quote(text)}")
+
+
 def handle_computer_actions(
     vm: VM,
     actions: Iterable[Any],
@@ -849,24 +966,27 @@ def handle_computer_actions(
         keys = _action_keys(action)
 
         activate_window(vm, window_id)
+        action_window_id = window_id
+        if action_type in {"click", "double_click", "move", "scroll", "drag"}:
+            action_window_id = active_owned_modal_window(vm, window_id) or window_id
         if action_type in {"type", "keypress"}:
             ensure_target_window_is_active(vm, window_id)
 
         def run_action() -> None:
             if action_type == "click":
                 vm.exec(
-                    f"{mousemove_command(vm, x, y, window_id)} click {button}",
+                    f"{mousemove_command(vm, x, y, action_window_id)} click {button}",
                 )
             elif action_type == "double_click":
                 vm.exec(
-                    f"{mousemove_command(vm, x, y, window_id)} click --repeat 2 {button}",
+                    f"{mousemove_command(vm, x, y, action_window_id)} click --repeat 2 {button}",
                 )
             elif action_type == "move":
-                vm.exec(mousemove_command(vm, x, y, window_id))
+                vm.exec(mousemove_command(vm, x, y, action_window_id))
             elif action_type == "scroll":
                 dx = _number(action, "scroll_x", "scrollX", "delta_x", "deltaX")
                 dy = _number(action, "scroll_y", "scrollY", "delta_y", "deltaY")
-                vm.exec(mousemove_command(vm, x, y, window_id))
+                vm.exec(mousemove_command(vm, x, y, action_window_id))
                 if dy:
                     scroll_button = 5 if dy > 0 else 4
                     for _ in range(max(1, int(abs(dy) // 100) or 1)):
@@ -877,9 +997,7 @@ def handle_computer_actions(
                         vm.exec(f"{display_prefix(vm)} xdotool click {scroll_button}")
             elif action_type == "type":
                 text = str(get_value(action, "text", ""))
-                vm.exec(
-                    f"{display_prefix(vm)} xdotool type --delay 0 {shell_quote(text)}",
-                )
+                type_text(vm, text)
             elif action_type == "keypress":
                 normalized = [normalize_xdotool_key(key) for key in keys]
                 if not normalized:
@@ -893,9 +1011,9 @@ def handle_computer_actions(
                 if len(path) < 2:
                     raise ValueError("drag action did not include a valid path")
                 start_x, start_y = path[0]
-                vm.exec(f"{mousemove_command(vm, start_x, start_y, window_id)} mousedown 1")
+                vm.exec(f"{mousemove_command(vm, start_x, start_y, action_window_id)} mousedown 1")
                 for point_x, point_y in path[1:]:
-                    vm.exec(mousemove_command(vm, point_x, point_y, window_id))
+                    vm.exec(mousemove_command(vm, point_x, point_y, action_window_id))
                 vm.exec(f"{display_prefix(vm)} xdotool mouseup 1")
             elif action_type == "wait":
                 duration_ms = _number(action, "ms", "duration_ms", default=2000)
@@ -909,18 +1027,23 @@ def handle_computer_actions(
 
 
 def capture_screenshot(vm: VM, window_id: WindowTarget = None) -> bytes:
-    resolved = target_window_id(window_id)
+    screenshot_window_id = active_owned_modal_window(vm, window_id) or window_id
+    resolved = target_window_id(screenshot_window_id)
     target = shell_quote(resolved or "root")
     try:
         screenshot = vm.exec(
-            f"export DISPLAY={shell_quote(vm.display)} && import -window {target} png:-",
+            f"export DISPLAY={shell_quote(vm.display)} && "
+            f"timeout --kill-after=1s {SCREENSHOT_CAPTURE_TIMEOUT_SECONDS}s "
+            f"import -window {target} png:-",
             decode=False,
         )
     except Exception as error:
         if resolved:
+            if not window_present(vm, screenshot_window_id):
+                return capture_screenshot(vm)
             raise StaleWindowError(
                 resolved,
-                logical_id=target_logical_id(window_id),
+                logical_id=target_logical_id(screenshot_window_id),
                 reason=f"screenshot failed: {error}",
             ) from error
         raise

@@ -1053,7 +1053,7 @@ def test_batched_actions_execute_in_order_and_are_logged(tmp_path):
     xdotool_commands = [cmd for cmd in commands if "xdotool" in cmd]
     assert xdotool_commands == [
         "DISPLAY=:99 xdotool mousemove 10 20 click 1",
-        "DISPLAY=:99 xdotool type --delay 0 hello",
+        "DISPLAY=:99 xdotool type --delay 0 -- hello",
     ]
     actions = read_jsonl(recorder.actions_path)
     assert [item["action"]["type"] for item in actions] == ["click", "type"]
@@ -1061,6 +1061,29 @@ def test_batched_actions_execute_in_order_and_are_logged(tmp_path):
     assert client.responses.requests[1]["input"] == []
     assert read_json(recorder.trajectory_path)["screenshots"] == []
     assert [cmd for cmd in commands if "import -window" in cmd] == []
+
+
+def test_type_text_separates_leading_dash_from_xdotool_options():
+    commands = []
+
+    cua_loop.type_text(make_vm(commands), "- Hostname: 8ac9c6c31dc4")
+
+    assert commands == [
+        "DISPLAY=:99 xdotool type --delay 0 -- '- Hostname: 8ac9c6c31dc4'",
+    ]
+
+
+def test_type_text_uses_clipboard_for_multiline_text():
+    commands = []
+
+    cua_loop.type_text(make_vm(commands), "System Health Report\n- Hostname: 8ac9c6c31dc4")
+
+    assert len(commands) == 2
+    assert commands[0] == "command -v xclip >/dev/null"
+    assert commands[1].startswith("(printf %s ")
+    assert " | DISPLAY=:99 timeout 5s xclip -selection clipboard -loops 1) " in commands[1]
+    assert commands[1].endswith("sleep 0.1; DISPLAY=:99 xdotool key ctrl+v")
+    assert not any("xdotool type" in command for command in commands)
 
 
 def test_window_targeted_click_focuses_and_uses_window_relative_coordinates(tmp_path):
@@ -1091,9 +1114,104 @@ def test_window_targeted_click_focuses_and_uses_window_relative_coordinates(tmp_
 
     xdotool_commands = [cmd for cmd in commands if "xdotool" in cmd]
     assert xdotool_commands == [
+        "DISPLAY=:99 xdotool getactivewindow",
         "DISPLAY=:99 xdotool windowactivate --sync 0x03a00007 windowraise 0x03a00007",
+        "DISPLAY=:99 xdotool getactivewindow",
         "DISPLAY=:99 xdotool mousemove --window 0x03a00007 10 20 click 1",
+        "DISPLAY=:99 xdotool getactivewindow",
     ]
+
+
+def test_window_targeted_click_uses_active_owned_modal_coordinates(tmp_path):
+    commands = []
+    modal_registry = "\n".join(
+        [
+            WMCTRL_SAMPLE,
+            "0x04000001  0 1234 100 200 300 200 libreoffice.LibreOffice host-a Untitled",
+        ],
+    )
+    client = FakeClient(
+        [
+            {
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_save",
+                        "actions": [{"type": "click", "x": 30, "y": 40}],
+                    },
+                ],
+            },
+            final_response(),
+        ],
+    )
+
+    run_computer_use_task(
+        client=client,
+        prompt="Click Save in the modal dialog.",
+        vm=make_vm(
+            commands,
+            responses={
+                "wmctrl -lpxG": modal_registry,
+                "xdotool getactivewindow": "0x04000001\n",
+                "xprop -id 0x04000001": (
+                    "WM_TRANSIENT_FOR:  not found.\n"
+                    "_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_DIALOG\n"
+                ),
+            },
+        ),
+        output_root=tmp_path,
+        window_id=direct_assignment(),
+    )
+
+    assert "DISPLAY=:99 xdotool mousemove --window 0x04000001 30 40 click 1" in commands
+    import_commands = [cmd for cmd in commands if "import -window" in cmd]
+    assert all("import -window 0x04000001" in command for command in import_commands)
+
+
+def test_window_targeted_click_uses_transient_for_popup(tmp_path):
+    commands = []
+    modal_registry = "\n".join(
+        [
+            WMCTRL_SAMPLE,
+            "0x04000001  0 1234 1200 800 300 200 libreoffice.LibreOffice host-a Untitled",
+        ],
+    )
+    client = FakeClient(
+        [
+            {
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_confirm",
+                        "actions": [{"type": "click", "x": 30, "y": 40}],
+                    },
+                ],
+            },
+            final_response(),
+        ],
+    )
+
+    run_computer_use_task(
+        client=client,
+        prompt="Click the active popup.",
+        vm=make_vm(
+            commands,
+            responses={
+                "wmctrl -lpxG": modal_registry,
+                "xdotool getactivewindow": "0x04000001\n",
+                "xprop -id 0x04000001": (
+                    "WM_TRANSIENT_FOR(WINDOW): window id # 0x03a00007\n"
+                    "_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_NORMAL\n"
+                ),
+            },
+        ),
+        output_root=tmp_path,
+        window_id=direct_assignment(),
+    )
+
+    assert "DISPLAY=:99 xdotool mousemove --window 0x04000001 30 40 click 1" in commands
 
 
 def test_window_targeted_screenshot_uses_window_id(tmp_path):
@@ -1110,10 +1228,75 @@ def test_window_targeted_screenshot_uses_window_id(tmp_path):
 
     import_commands = [cmd for cmd in commands if "import -window" in cmd]
     assert import_commands == [
-        "export DISPLAY=:99 && import -window 0x03a00007 png:-",
+        "export DISPLAY=:99 && timeout --kill-after=1s "
+        f"{cua_loop.SCREENSHOT_CAPTURE_TIMEOUT_SECONDS}s "
+        "import -window 0x03a00007 png:-",
     ]
     trajectory = read_json(recorder.trajectory_path)
     assert trajectory["screenshots"][0]["path"] == "screenshots/initial/firefox_1/000-initial.png"
+
+
+def test_post_action_screenshot_falls_back_to_root_when_window_closed(tmp_path):
+    commands = []
+    target_import_calls = 0
+    window_open = True
+
+    def disappearing_window_screenshot(_cmd):
+        nonlocal target_import_calls
+        target_import_calls += 1
+        if window_open:
+            return b"png-bytes"
+        return TimeoutError("screenshot timed out")
+
+    def click_closes_window(_cmd):
+        nonlocal window_open
+        window_open = False
+        return ""
+
+    def registry(_cmd):
+        if window_open:
+            return WMCTRL_SAMPLE
+        return "0x03c00001  0 2345 30 50 640 480 xfce4-terminal.Xfce4-terminal host-a Terminal"
+
+    client = FakeClient(
+        [
+            {
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_dialog",
+                        "actions": [{"type": "click", "x": 421, "y": 88}],
+                    },
+                ],
+            },
+            final_response(),
+        ],
+    )
+
+    run_computer_use_task(
+        client=client,
+        prompt="Close the dialog.",
+        vm=make_vm(
+            commands,
+            responses={
+                "wmctrl -lpxG": registry,
+                "xdotool mousemove --window 0x03a00007 421 88 click 1": click_closes_window,
+                "import -window 0x03a00007": disappearing_window_screenshot,
+            },
+        ),
+        output_root=tmp_path,
+        window_id=direct_assignment(),
+    )
+
+    run_dirs = list(tmp_path.iterdir())
+    actions = read_jsonl(run_dirs[0] / "actions.jsonl")
+    trajectory = read_json(run_dirs[0] / "trajectory.json")
+    assert actions[0]["status"] == "completed"
+    assert trajectory["status"] == "completed"
+    assert target_import_calls == 2
+    assert any("import -window root" in command for command in commands)
+    assert len(client.responses.requests) == 2
 
 
 def test_window_assignment_validates_stage_start_and_records_snapshot(tmp_path):
@@ -1176,8 +1359,98 @@ def test_window_targeted_type_checks_active_window_before_typing(tmp_path):
     assert xdotool_commands == [
         "DISPLAY=:99 xdotool windowactivate --sync 0x03a00007 windowraise 0x03a00007",
         "DISPLAY=:99 xdotool getactivewindow",
-        "DISPLAY=:99 xdotool type --delay 0 hi",
+        "DISPLAY=:99 xdotool type --delay 0 -- hi",
     ]
+
+
+def test_window_targeted_type_allows_active_owned_modal(tmp_path):
+    commands = []
+    modal_registry = "\n".join(
+        [
+            WMCTRL_SAMPLE,
+            "0x04000001  0 1234 100 200 300 200 libreoffice.LibreOffice host-a Untitled",
+        ],
+    )
+    client = FakeClient(
+        [
+            {
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_filename",
+                        "actions": [{"type": "type", "text": "system_health_report.odt"}],
+                    },
+                ],
+            },
+            final_response(),
+        ],
+    )
+
+    run_computer_use_task(
+        client=client,
+        prompt="Type into the active save dialog.",
+        vm=make_vm(
+            commands,
+            responses={
+                "wmctrl -lpxG": modal_registry,
+                "xdotool getactivewindow": "0x04000001\n",
+                "xprop -id 0x04000001": (
+                    "WM_TRANSIENT_FOR:  not found.\n"
+                    "_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_DIALOG\n"
+                ),
+            },
+        ),
+        output_root=tmp_path,
+        window_id=direct_assignment(),
+    )
+
+    assert "DISPLAY=:99 xdotool type --delay 0 -- system_health_report.odt" in commands
+
+
+def test_window_targeted_type_rejects_same_pid_non_popup_window(tmp_path):
+    commands = []
+    same_pid_main_window_registry = "\n".join(
+        [
+            WMCTRL_SAMPLE,
+            "0x04000001  0 1234 1200 40 900 700 Navigator.firefox host-a Other Document",
+        ],
+    )
+    client = FakeClient(
+        [
+            {
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "computer_call",
+                        "call_id": "call_type",
+                        "actions": [{"type": "type", "text": "hi"}],
+                    },
+                ],
+            },
+        ],
+    )
+
+    with pytest.raises(StaleWindowError):
+        run_computer_use_task(
+            client=client,
+            prompt="Type in the assigned window.",
+            vm=make_vm(
+                commands,
+                responses={
+                    "wmctrl -lpxG": same_pid_main_window_registry,
+                    "xdotool getactivewindow": "0x04000001\n",
+                    "xprop -id 0x04000001": (
+                        "WM_TRANSIENT_FOR:  not found.\n"
+                        "_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_NORMAL\n"
+                    ),
+                },
+            ),
+            output_root=tmp_path,
+            window_id=direct_assignment(),
+        )
+
+    assert not any("xdotool type" in command for command in commands)
 
 
 def test_window_targeted_type_fails_before_typing_when_focus_check_mismatches(tmp_path):
@@ -1233,7 +1506,7 @@ def test_input_arbiter_serializes_concurrent_actions_fifo():
     xdotool_commands = [cmd for cmd in commands if "xdotool" in cmd]
     assert xdotool_commands == [
         "DISPLAY=:99 xdotool mousemove 1 2 click 1",
-        "DISPLAY=:99 xdotool type --delay 0 hi",
+        "DISPLAY=:99 xdotool type --delay 0 -- hi",
     ]
 
 

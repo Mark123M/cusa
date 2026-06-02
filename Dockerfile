@@ -7,6 +7,7 @@ RUN apt-get update \
         xfce4-goodies \
         x11vnc \
         xvfb \
+        xclip \
         xdotool \
         wmctrl \
         imagemagick \
