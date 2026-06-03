@@ -25,6 +25,7 @@ from cua_loop import (
     WindowLogicalIdRegistry,
     _parse_wmctrl_lpxg,
     append_stage_result,
+    build_pid_groups,
     build_planner_prompt,
     format_task_progress_ledger,
     latest_screenshots_by_window,
@@ -252,7 +253,7 @@ def test_planner_plan_validation_accepts_known_windows_and_open_requests():
             PlannerWindowRequest(logical_id="browser_alias", kind="browser", reason="Need a page."),
         ],
         assignments=[
-            PlannerAssignment(window="firefox_1", subtasks=["Inspect the current tab."]),
+            PlannerAssignment(pid=1234, subtasks=["Inspect the current tab."]),
         ],
     )
 
@@ -287,10 +288,10 @@ def test_planner_plan_model_rejects_invalid_kind_and_done_shape():
                 done=False,
                 final_response="",
                 windows_to_open=[],
-                assignments=[PlannerAssignment(window="missing_1", subtasks=["Look."])],
+                assignments=[PlannerAssignment(pid=9999, subtasks=["Look."])],
             ),
             1,
-            "unknown window",
+            "unknown pid",
         ),
         (
             PlannerPlan(
@@ -298,8 +299,8 @@ def test_planner_plan_model_rejects_invalid_kind_and_done_shape():
                 final_response="",
                 windows_to_open=[],
                 assignments=[
-                    PlannerAssignment(window="firefox_1", subtasks=["Look."]),
-                    PlannerAssignment(window="firefox_1", subtasks=["Look again."]),
+                    PlannerAssignment(pid=1234, subtasks=["Look."]),
+                    PlannerAssignment(pid=1234, subtasks=["Look again."]),
                 ],
             ),
             2,
@@ -311,8 +312,8 @@ def test_planner_plan_model_rejects_invalid_kind_and_done_shape():
                 final_response="",
                 windows_to_open=[],
                 assignments=[
-                    PlannerAssignment(window="firefox_1", subtasks=["Look."]),
-                    PlannerAssignment(window="xfce4_terminal_1", subtasks=["List files."]),
+                    PlannerAssignment(pid=1234, subtasks=["Look."]),
+                    PlannerAssignment(pid=2345, subtasks=["List files."]),
                 ],
             ),
             1,
@@ -405,6 +406,28 @@ def test_window_logical_id_registry_assigns_monotonic_prompt_scoped_ids():
     ]
 
 
+def test_pid_grouping_keeps_same_process_windows_together():
+    windows = _parse_wmctrl_lpxg(
+        "\n".join(
+            [
+                "0x0300007a  0 326 0 0 900 700 libreoffice.LibreOffice host-a LibreOffice Recovery",
+                "0x0300012f  0 326 0 0 900 700 libreoffice-writer.LibreOffice-writer host-a Untitled 1 - LibreOffice Writer",
+                "0x03000d16  0 326 100 100 400 200 libreoffice-writer.LibreOffice-writer host-a Confirm Save As",
+                "0x03c00001  0 2345 30 50 640 480 xfce4-terminal.Xfce4-terminal host-a Terminal",
+            ],
+        ),
+    )
+
+    groups = build_pid_groups(windows)
+
+    assert sorted(groups) == [326, 2345]
+    assert [window.window_id for window in groups[326].windows] == [
+        "0x0300007a",
+        "0x0300012f",
+        "0x03000d16",
+    ]
+
+
 def test_orchestration_runs_stage_in_parallel_and_refreshes_registry(tmp_path):
     commands = []
     subagents_done = False
@@ -427,8 +450,8 @@ def test_orchestration_runs_stage_in_parallel_and_refreshes_registry(tmp_path):
                     "final_response": "",
                     "windows_to_open": [],
                     "assignments": [
-                        {"window": "firefox_1", "subtasks": ["Read the page."]},
-                        {"window": "xfce4_terminal_1", "subtasks": ["Check files."]},
+                        {"pid": 1234, "subtasks": ["Read the page."]},
+                        {"pid": 2345, "subtasks": ["Check files."]},
                     ],
                 },
             ),
@@ -478,12 +501,12 @@ def test_orchestration_runs_stage_in_parallel_and_refreshes_registry(tmp_path):
     final_text, recorder = asyncio.run(run())
 
     assert final_text == "All windows checked."
-    assert [item[0] for item in started] == ["firefox_1", "xfce4_terminal_1"]
+    assert [item[0] for item in started] == ["pid_1234", "pid_2345"]
     assert len(client.responses.requests) == 2
     assert client.responses.requests[0]["text"]["format"]["type"] == "json_schema"
     second_planner_text = client.responses.requests[1]["input"][0]["content"][0]["text"]
-    assert "Handled firefox_1" in second_planner_text
-    assert "Handled xfce4_terminal_1" in second_planner_text
+    assert "Handled pid_1234" in second_planner_text
+    assert "Handled pid_2345" in second_planner_text
     assert "editor_1" in second_planner_text
     assert any(
         part["type"] == "input_image"
@@ -512,7 +535,7 @@ def test_orchestration_dumps_planner_and_subagent_prompts(tmp_path):
                     "final_response": "",
                     "windows_to_open": [],
                     "assignments": [
-                        {"window": "firefox_1", "subtasks": ["Read the page."]},
+                        {"pid": 1234, "subtasks": ["Read the page."]},
                     ],
                 },
             ),
@@ -571,13 +594,14 @@ def test_orchestration_dumps_planner_and_subagent_prompts(tmp_path):
     subagent_dir = (
         recorder.run_dir
         / "prompts"
-        / "subagent-stage-001-firefox_1"
+        / "subagent-stage-001-pid_1234"
         / "stage_001"
         / "subagents"
     )
     subagent_prompt = (subagent_dir / "prompt.txt").read_text(encoding="utf-8")
 
-    assert "Assigned window: firefox_1 (0x03a00007)" in subagent_prompt
+    assert "Assigned pid group: pid_1234 (pid 1234)" in subagent_prompt
+    assert "firefox_1" in subagent_prompt
     assert "1. Read the page." in subagent_prompt
     assert not list(subagent_dir.glob("*.png"))
     assert not list(subagent_dir.glob("*.json"))
@@ -680,7 +704,7 @@ def test_orchestration_keeps_logical_ids_stable_when_open_reorders_registry(tmp_
                         {"logical_id": "browser_alias", "kind": "browser", "reason": "Need comparison."},
                     ],
                     "assignments": [
-                        {"window": "firefox_1", "subtasks": ["Read the original page."]},
+                        {"pid": 1234, "subtasks": ["Read the original page."]},
                     ],
                 },
             ),
@@ -697,10 +721,10 @@ def test_orchestration_keeps_logical_ids_stable_when_open_reorders_registry(tmp_
     started = []
 
     async def invoke(window_id, _prompt):
-        started.append((window_id.logical_id, window_id.window_id))
+        started.append((window_id.logical_id, window_id.current_window.window_id))
         return StageResult(
             what_they_did=f"Handled {window_id.logical_id}",
-            steps_taken=f"Used {window_id.window_id}",
+            steps_taken=f"Used {window_id.current_window.window_id}",
             failure_reason="",
         )
 
@@ -720,9 +744,9 @@ def test_orchestration_keeps_logical_ids_stable_when_open_reorders_registry(tmp_
     final_text, recorder = asyncio.run(run())
 
     assert final_text == "Browser windows are stable."
-    assert started == [("firefox_1", "0x03a00007")]
+    assert started == [("pid_1234", "0x03a00007")]
     second_planner_text = client.responses.requests[1]["input"][0]["content"][0]["text"]
-    assert "Handled firefox_1" in second_planner_text
+    assert "Handled pid_1234" in second_planner_text
     assert '"logical_id": "firefox_1"' in second_planner_text
     assert '"window_id": "0x03a00007"' in second_planner_text
     assert '"logical_id": "firefox_2"' in second_planner_text
@@ -765,7 +789,7 @@ def test_orchestration_resolves_same_stage_assignments_before_open_refresh(tmp_p
                         {"logical_id": "browser_alias", "kind": "browser", "reason": "Need another browser."},
                     ],
                     "assignments": [
-                        {"window": "firefox_1", "subtasks": ["Read the original page before it disappears."]},
+                        {"pid": 1234, "subtasks": ["Read the original page before it disappears."]},
                     ],
                 },
             ),
@@ -782,10 +806,10 @@ def test_orchestration_resolves_same_stage_assignments_before_open_refresh(tmp_p
     started = []
 
     async def invoke(window_id, _prompt):
-        started.append((window_id.logical_id, window_id.window_id))
+        started.append((window_id.logical_id, window_id.current_window.window_id))
         return StageResult(
             what_they_did=f"Handled {window_id.logical_id}",
-            steps_taken=f"Used {window_id.window_id}",
+            steps_taken=f"Used {window_id.current_window.window_id}",
             failure_reason="",
         )
 
@@ -805,7 +829,7 @@ def test_orchestration_resolves_same_stage_assignments_before_open_refresh(tmp_p
     final_text, _recorder = asyncio.run(run())
 
     assert final_text == "Original browser assignment was preserved."
-    assert started == [("firefox_1", "0x03a00007")]
+    assert started == [("pid_1234", "0x03a00007")]
 
 
 def test_orchestration_cli_uses_opt_in_path(monkeypatch, capsys):
@@ -1114,31 +1138,30 @@ def test_window_targeted_click_focuses_and_uses_window_relative_coordinates(tmp_
 
     xdotool_commands = [cmd for cmd in commands if "xdotool" in cmd]
     assert xdotool_commands == [
-        "DISPLAY=:99 xdotool getactivewindow",
         "DISPLAY=:99 xdotool windowactivate --sync 0x03a00007 windowraise 0x03a00007",
-        "DISPLAY=:99 xdotool getactivewindow",
         "DISPLAY=:99 xdotool mousemove --window 0x03a00007 10 20 click 1",
-        "DISPLAY=:99 xdotool getactivewindow",
     ]
 
 
-def test_window_targeted_click_uses_active_owned_modal_coordinates(tmp_path):
+def test_pid_group_switch_window_changes_current_target(tmp_path):
     commands = []
-    modal_registry = "\n".join(
+    pid_registry = "\n".join(
         [
             WMCTRL_SAMPLE,
             "0x04000001  0 1234 100 200 300 200 libreoffice.LibreOffice host-a Untitled",
         ],
     )
+    group = build_pid_groups(_parse_wmctrl_lpxg(pid_registry))[1234]
     client = FakeClient(
         [
             {
                 "id": "resp_1",
                 "output": [
                     {
-                        "type": "computer_call",
-                        "call_id": "call_save",
-                        "actions": [{"type": "click", "x": 30, "y": 40}],
+                        "type": "function_call",
+                        "call_id": "call_switch",
+                        "name": "switch_window",
+                        "arguments": json.dumps({"window": "libreoffice_1"}),
                     },
                 ],
             },
@@ -1148,44 +1171,32 @@ def test_window_targeted_click_uses_active_owned_modal_coordinates(tmp_path):
 
     run_computer_use_task(
         client=client,
-        prompt="Click Save in the modal dialog.",
-        vm=make_vm(
-            commands,
-            responses={
-                "wmctrl -lpxG": modal_registry,
-                "xdotool getactivewindow": "0x04000001\n",
-                "xprop -id 0x04000001": (
-                    "WM_TRANSIENT_FOR:  not found.\n"
-                    "_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_DIALOG\n"
-                ),
-            },
-        ),
+        prompt="Switch to the LibreOffice window.",
+        vm=make_vm(commands, responses={"wmctrl -lpxG": pid_registry}),
         output_root=tmp_path,
-        window_id=direct_assignment(),
+        window_id=group,
     )
 
-    assert "DISPLAY=:99 xdotool mousemove --window 0x04000001 30 40 click 1" in commands
-    import_commands = [cmd for cmd in commands if "import -window" in cmd]
-    assert all("import -window 0x04000001" in command for command in import_commands)
+    assert group.current_window.window_id == "0x04000001"
+    assert "DISPLAY=:99 xdotool windowactivate --sync 0x04000001 windowraise 0x04000001" in commands
+    followup_input = client.responses.requests[1]["input"]
+    assert followup_input[0]["type"] == "function_call_output"
+    assert '"status": "switched"' in followup_input[0]["output"]
 
 
-def test_window_targeted_click_uses_transient_for_popup(tmp_path):
+def test_screenshot_windows_captures_same_pid_and_rejects_the_rest(tmp_path):
     commands = []
-    modal_registry = "\n".join(
-        [
-            WMCTRL_SAMPLE,
-            "0x04000001  0 1234 1200 800 300 200 libreoffice.LibreOffice host-a Untitled",
-        ],
-    )
+    group = build_pid_groups(_parse_wmctrl_lpxg(WMCTRL_SAMPLE))[1234]
     client = FakeClient(
         [
             {
                 "id": "resp_1",
                 "output": [
                     {
-                        "type": "computer_call",
-                        "call_id": "call_confirm",
-                        "actions": [{"type": "click", "x": 30, "y": 40}],
+                        "type": "function_call",
+                        "call_id": "call_screens",
+                        "name": "screenshot_windows",
+                        "arguments": json.dumps({"windows": ["firefox_1", "0x03c00001", "missing_1"]}),
                     },
                 ],
             },
@@ -1193,25 +1204,24 @@ def test_window_targeted_click_uses_transient_for_popup(tmp_path):
         ],
     )
 
-    run_computer_use_task(
+    _, recorder = run_computer_use_task(
         client=client,
-        prompt="Click the active popup.",
-        vm=make_vm(
-            commands,
-            responses={
-                "wmctrl -lpxG": modal_registry,
-                "xdotool getactivewindow": "0x04000001\n",
-                "xprop -id 0x04000001": (
-                    "WM_TRANSIENT_FOR(WINDOW): window id # 0x03a00007\n"
-                    "_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_NORMAL\n"
-                ),
-            },
-        ),
+        prompt="Capture windows in my pid group.",
+        vm=make_vm(commands, responses=registry_responses()),
         output_root=tmp_path,
-        window_id=direct_assignment(),
+        window_id=group,
     )
 
-    assert "DISPLAY=:99 xdotool mousemove --window 0x04000001 30 40 click 1" in commands
+    import_commands = [cmd for cmd in commands if "import -window" in cmd]
+    assert any("import -window 0x03a00007" in command for command in import_commands)
+    assert not any("import -window 0x03c00001" in command for command in import_commands)
+    followup_input = client.responses.requests[1]["input"]
+    assert followup_input[0]["type"] == "function_call_output"
+    assert '"status": "captured"' in followup_input[0]["output"]
+    assert '"status": "rejected"' in followup_input[0]["output"]
+    assert any(item["type"] == "input_image" for item in followup_input[1]["content"])
+    trajectory = read_json(recorder.trajectory_path)
+    assert any(item["window"] == "firefox_1" for item in trajectory["screenshots"])
 
 
 def test_window_targeted_screenshot_uses_window_id(tmp_path):
@@ -1236,7 +1246,7 @@ def test_window_targeted_screenshot_uses_window_id(tmp_path):
     assert trajectory["screenshots"][0]["path"] == "screenshots/initial/firefox_1/000-initial.png"
 
 
-def test_post_action_screenshot_falls_back_to_root_when_window_closed(tmp_path):
+def test_pid_group_stale_post_action_screenshot_refreshes_group_and_continues(tmp_path):
     commands = []
     target_import_calls = 0
     window_open = True
@@ -1273,6 +1283,7 @@ def test_post_action_screenshot_falls_back_to_root_when_window_closed(tmp_path):
             final_response(),
         ],
     )
+    group = build_pid_groups(_parse_wmctrl_lpxg(WMCTRL_SAMPLE))[1234]
 
     run_computer_use_task(
         client=client,
@@ -1286,7 +1297,7 @@ def test_post_action_screenshot_falls_back_to_root_when_window_closed(tmp_path):
             },
         ),
         output_root=tmp_path,
-        window_id=direct_assignment(),
+        window_id=group,
     )
 
     run_dirs = list(tmp_path.iterdir())
@@ -1295,8 +1306,12 @@ def test_post_action_screenshot_falls_back_to_root_when_window_closed(tmp_path):
     assert actions[0]["status"] == "completed"
     assert trajectory["status"] == "completed"
     assert target_import_calls == 2
+    assert group.current_window is None
     assert any("import -window root" in command for command in commands)
     assert len(client.responses.requests) == 2
+    followup_input = client.responses.requests[1]["input"]
+    assert followup_input[0]["type"] == "computer_call_output"
+    assert "Window target recovery" in followup_input[1]["content"][0]["text"]
 
 
 def test_window_assignment_validates_stage_start_and_records_snapshot(tmp_path):
@@ -1363,23 +1378,32 @@ def test_window_targeted_type_checks_active_window_before_typing(tmp_path):
     ]
 
 
-def test_window_targeted_type_allows_active_owned_modal(tmp_path):
+def test_refresh_pid_group_tool_updates_windows(tmp_path):
     commands = []
-    modal_registry = "\n".join(
+    refreshed_registry = "\n".join(
         [
             WMCTRL_SAMPLE,
             "0x04000001  0 1234 100 200 300 200 libreoffice.LibreOffice host-a Untitled",
         ],
     )
+    registry_calls = 0
+
+    def registry(_cmd):
+        nonlocal registry_calls
+        registry_calls += 1
+        return WMCTRL_SAMPLE if registry_calls == 1 else refreshed_registry
+
+    group = build_pid_groups(_parse_wmctrl_lpxg(WMCTRL_SAMPLE))[1234]
     client = FakeClient(
         [
             {
                 "id": "resp_1",
                 "output": [
                     {
-                        "type": "computer_call",
-                        "call_id": "call_filename",
-                        "actions": [{"type": "type", "text": "system_health_report.odt"}],
+                        "type": "function_call",
+                        "call_id": "call_refresh",
+                        "name": "refresh_pid_group",
+                        "arguments": "{}",
                     },
                 ],
             },
@@ -1389,68 +1413,51 @@ def test_window_targeted_type_allows_active_owned_modal(tmp_path):
 
     run_computer_use_task(
         client=client,
-        prompt="Type into the active save dialog.",
-        vm=make_vm(
-            commands,
-            responses={
-                "wmctrl -lpxG": modal_registry,
-                "xdotool getactivewindow": "0x04000001\n",
-                "xprop -id 0x04000001": (
-                    "WM_TRANSIENT_FOR:  not found.\n"
-                    "_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_DIALOG\n"
-                ),
-            },
-        ),
+        prompt="Refresh my pid windows.",
+        vm=make_vm(commands, responses={"wmctrl -lpxG": registry}),
         output_root=tmp_path,
-        window_id=direct_assignment(),
+        window_id=group,
     )
 
-    assert "DISPLAY=:99 xdotool type --delay 0 -- system_health_report.odt" in commands
+    assert [window.window_id for window in group.windows] == ["0x03a00007", "0x04000001"]
+    followup_input = client.responses.requests[1]["input"]
+    assert followup_input[0]["type"] == "function_call_output"
+    assert '"status": "refreshed"' in followup_input[0]["output"]
+    assert "0x04000001" in followup_input[0]["output"]
 
 
-def test_window_targeted_type_rejects_same_pid_non_popup_window(tmp_path):
+def test_switch_window_rejects_out_of_pid_window(tmp_path):
     commands = []
-    same_pid_main_window_registry = "\n".join(
-        [
-            WMCTRL_SAMPLE,
-            "0x04000001  0 1234 1200 40 900 700 Navigator.firefox host-a Other Document",
-        ],
-    )
+    group = build_pid_groups(_parse_wmctrl_lpxg(WMCTRL_SAMPLE))[1234]
     client = FakeClient(
         [
             {
                 "id": "resp_1",
                 "output": [
                     {
-                        "type": "computer_call",
-                        "call_id": "call_type",
-                        "actions": [{"type": "type", "text": "hi"}],
+                        "type": "function_call",
+                        "call_id": "call_switch",
+                        "name": "switch_window",
+                        "arguments": json.dumps({"window": "xfce4_terminal_1"}),
                     },
                 ],
             },
+            final_response(),
         ],
     )
 
-    with pytest.raises(StaleWindowError):
-        run_computer_use_task(
-            client=client,
-            prompt="Type in the assigned window.",
-            vm=make_vm(
-                commands,
-                responses={
-                    "wmctrl -lpxG": same_pid_main_window_registry,
-                    "xdotool getactivewindow": "0x04000001\n",
-                    "xprop -id 0x04000001": (
-                        "WM_TRANSIENT_FOR:  not found.\n"
-                        "_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_NORMAL\n"
-                    ),
-                },
-            ),
-            output_root=tmp_path,
-            window_id=direct_assignment(),
-        )
+    run_computer_use_task(
+        client=client,
+        prompt="Try to switch outside my pid group.",
+        vm=make_vm(commands, responses=registry_responses()),
+        output_root=tmp_path,
+        window_id=group,
+    )
 
-    assert not any("xdotool type" in command for command in commands)
+    assert group.current_window.window_id == "0x03a00007"
+    assert not any("windowactivate --sync 0x03c00001" in command for command in commands)
+    followup_input = client.responses.requests[1]["input"]
+    assert '"status": "rejected"' in followup_input[0]["output"]
 
 
 def test_window_targeted_type_fails_before_typing_when_focus_check_mismatches(tmp_path):
@@ -1715,7 +1722,7 @@ def test_action_failure_is_persisted(tmp_path):
     assert [cmd for cmd in commands if "import -window" in cmd] == []
 
 
-def test_stale_activation_failure_is_structured_and_not_retried(tmp_path):
+def test_pid_group_stale_activation_refreshes_group_and_continues(tmp_path):
     commands = []
     client = FakeClient(
         [
@@ -1729,27 +1736,33 @@ def test_stale_activation_failure_is_structured_and_not_retried(tmp_path):
                     },
                 ],
             },
+            final_response(),
         ],
     )
+    group = build_pid_groups(_parse_wmctrl_lpxg(WMCTRL_SAMPLE))[1234]
 
-    with pytest.raises(StaleWindowError):
-        run_computer_use_task(
-            client=client,
-            prompt="Click.",
-            vm=make_vm(
-                commands,
-                fail_on="xdotool windowactivate --sync 0x03a00007",
-                responses=registry_responses(),
-            ),
-            output_root=tmp_path,
-            window_id=direct_assignment(),
-        )
+    run_computer_use_task(
+        client=client,
+        prompt="Click.",
+        vm=make_vm(
+            commands,
+            fail_on="xdotool windowactivate --sync 0x03a00007",
+            responses=registry_responses(),
+        ),
+        output_root=tmp_path,
+        window_id=group,
+    )
 
     run_dirs = list(tmp_path.iterdir())
     actions = read_jsonl(run_dirs[0] / "actions.jsonl")
+    trajectory = read_json(run_dirs[0] / "trajectory.json")
     assert actions[0]["status"] == "failed"
     assert "Stale window firefox_1 (0x03a00007)" in actions[0]["error"]
     assert not any("xdotool mousemove --window 0x03a00007 5 6" in cmd for cmd in commands)
+    assert trajectory["status"] == "completed"
+    followup_input = client.responses.requests[1]["input"]
+    assert followup_input[0]["type"] == "computer_call_output"
+    assert "Window target recovery" in followup_input[1]["content"][0]["text"]
 
 
 def test_stale_screenshot_failure_marks_screenshot_action_failed(tmp_path):

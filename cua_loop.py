@@ -27,21 +27,6 @@ DEFAULT_MODEL = "gpt-5.5"
 DEFAULT_OUTPUT_DIR = "cua-runs"
 SCREENSHOT_CAPTURE_TIMEOUT_SECONDS = 2
 CLIPBOARD_TYPE_CHAR_THRESHOLD = 200
-OWNED_POPUP_WINDOW_TYPES = {
-    "_NET_WM_WINDOW_TYPE_COMBO",
-    "_NET_WM_WINDOW_TYPE_DIALOG",
-    "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
-    "_NET_WM_WINDOW_TYPE_MENU",
-    "_NET_WM_WINDOW_TYPE_NOTIFICATION",
-    "_NET_WM_WINDOW_TYPE_POPUP_MENU",
-    "_NET_WM_WINDOW_TYPE_SPLASH",
-    "_NET_WM_WINDOW_TYPE_TOOLTIP",
-    "_NET_WM_WINDOW_TYPE_UTILITY",
-}
-XPROP_POPUP_PROPERTIES = (
-    "WM_TRANSIENT_FOR",
-    "_NET_WM_WINDOW_TYPE",
-)
 
 
 class SafetyCheckRequired(RuntimeError):
@@ -114,7 +99,15 @@ class WindowAssignment:
     pid: int | None = None
 
 
-WindowTarget = WindowAssignment | None
+@dataclass
+class PidGroupAssignment:
+    logical_id: str
+    pid: int
+    windows: list[WindowInfo]
+    current_window: WindowAssignment | None = None
+
+
+WindowTarget = WindowAssignment | PidGroupAssignment | None
 
 
 @dataclass
@@ -170,16 +163,8 @@ class PlannerWindowRequest(BaseModel):
 class PlannerAssignment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    window: str = Field(min_length=1)
+    pid: int = Field(gt=0)
     subtasks: list[str] = Field(min_length=1)
-
-    @field_validator("window")
-    @classmethod
-    def _strip_window(cls, value: str) -> str:
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("window is required")
-        return stripped
 
     @field_validator("subtasks")
     @classmethod
@@ -232,11 +217,12 @@ PLANNER_GUIDELINES = f"""\
 You are the central planner for a pool of computer-use subagents in one Linux virtual display.
 
 Return only strict JSON matching the requested schema. Plan one stage at a time.
-- Each assignment must target exactly one visible window logical_id from the latest registry.
+- Each assignment must target exactly one visible pid from the latest registry.
+- Assign a pid once at most per stage; one subagent owns all visible windows under that pid.
 - windows_to_open launches windows for future planner stages; do not assign subtasks to those requested logical_ids until they appear in a later registry.
-- Each assignment's subtasks must be independent of every other assignment in the same stage.
-- If a dependency exists between windows, serialize it by assigning only the prerequisite work in this stage.
-- Do cross-window reasoning yourself after subagents return; do not ask a subagent to reason across windows.
+- Each assignment's subtasks must be independent of every other pid assignment in the same stage.
+- If a dependency exists between pids, serialize it by assigning only the prerequisite work in this stage.
+- Subagents may reason across windows in their assigned pid only.
 - Use windows_to_open only for allowlisted semantic kinds: {", ".join(sorted(ALLOWED_WINDOW_OPEN_COMMANDS))}.
 - Set done true only when the original user prompt is complete, and include final_response.
 """
@@ -256,6 +242,8 @@ def planner_text_format() -> dict[str, Any]:
 def task_window_key(window_id: WindowTarget) -> str | None:
     if window_id is None:
         return None
+    if isinstance(window_id, PidGroupAssignment):
+        return window_id.logical_id
     return window_id.logical_id or window_id.window_id
 
 
@@ -354,24 +342,40 @@ def validate_planner_plan(
         if request.kind not in ALLOWED_WINDOW_OPEN_COMMANDS:
             raise PlannerOutputError(f"Unsupported window kind: {request.kind}")
 
-    known_windows = {window.logical_id for window in windows}
-    seen_assignments: set[str] = set()
+    known_pids = {window.pid for window in windows if window.pid is not None and window.pid > 0}
+    seen_assignments: set[int] = set()
     for assignment in plan.assignments:
-        if assignment.window in seen_assignments:
-            raise PlannerOutputError(f"Duplicate assignment for window: {assignment.window}")
-        seen_assignments.add(assignment.window)
-        if assignment.window not in known_windows:
-            raise PlannerOutputError(f"Assignment references unknown window: {assignment.window}")
+        if assignment.pid in seen_assignments:
+            raise PlannerOutputError(f"Duplicate assignment for pid: {assignment.pid}")
+        seen_assignments.add(assignment.pid)
+        if assignment.pid not in known_pids:
+            raise PlannerOutputError(f"Assignment references unknown pid: {assignment.pid}")
 
     if not plan.windows_to_open and not plan.assignments:
         raise PlannerOutputError("Planner must either finish, open a window, or assign subtasks.")
 
 
-def window_assignments_by_logical(windows: Iterable[WindowInfo]) -> dict[str, WindowAssignment]:
-    return {
-        window.logical_id: window_assignment_from_info(window)
-        for window in windows
-    }
+def pid_group_logical_id(pid: int) -> str:
+    return f"pid_{pid}"
+
+
+def build_pid_groups(windows: Iterable[WindowInfo]) -> dict[int, PidGroupAssignment]:
+    grouped: dict[int, list[WindowInfo]] = {}
+    for window in windows:
+        if window.pid is None or window.pid <= 0:
+            continue
+        grouped.setdefault(window.pid, []).append(window)
+
+    groups: dict[int, PidGroupAssignment] = {}
+    for pid, group_windows in grouped.items():
+        current_window = window_assignment_from_info(group_windows[0]) if group_windows else None
+        groups[pid] = PidGroupAssignment(
+            logical_id=pid_group_logical_id(pid),
+            pid=pid,
+            windows=list(group_windows),
+            current_window=current_window,
+        )
+    return groups
 
 
 SubagentInvoker = Callable[
@@ -434,12 +438,18 @@ def normalize_window_id(value: Any) -> int:
 def target_window_id(window_id: WindowTarget) -> str | None:
     if window_id is None:
         return None
+    if isinstance(window_id, PidGroupAssignment):
+        return target_window_id(window_id.current_window)
     return window_id.window_id
 
 
 def target_logical_id(window_id: WindowTarget) -> str | None:
     if window_id is None:
         return None
+    if isinstance(window_id, PidGroupAssignment):
+        if window_id.current_window is not None:
+            return window_id.current_window.logical_id
+        return window_id.logical_id
     return window_id.logical_id
 
 
@@ -570,75 +580,28 @@ def find_window_assignment(
     return window_assignment_from_info(window)
 
 
-def window_xprop(vm: VM, window_id: str) -> str:
-    raw = vm.exec(
-        f"{display_prefix(vm)} xprop -id {shell_quote(window_id)} "
-        + " ".join(XPROP_POPUP_PROPERTIES),
-    )
-    if isinstance(raw, bytes):
-        return raw.decode("utf-8", errors="replace")
-    return str(raw)
-
-
-def xprop_transient_for(output: str) -> int | None:
-    match = re.search(r"WM_TRANSIENT_FOR\(WINDOW\):\s+window id #\s+(\S+)", output)
-    if not match:
+def find_pid_group_window(group: PidGroupAssignment, value: Any) -> WindowInfo | None:
+    text = str(value).strip()
+    if not text:
         return None
+
+    for window in group.windows:
+        if window.logical_id == text or window.window_id.lower() == text.lower():
+            return window
+
     try:
-        return normalize_window_id(match.group(1))
+        expected_id = normalize_window_id(text)
     except ValueError:
         return None
+    return find_window_info(group.windows, expected_id)
 
 
-def xprop_window_types(output: str) -> set[str]:
-    return set(re.findall(r"_NET_WM_WINDOW_TYPE_[A-Z0-9_]+", output))
-
-
-def active_window_is_owned_popup(
-    vm: VM,
-    assignment: WindowAssignment,
-    active_window: WindowInfo,
-) -> bool:
-    if active_window.pid != assignment.pid:
-        return False
-
-    try:
-        properties = window_xprop(vm, active_window.window_id)
-    except Exception:
-        properties = ""
-
-    transient_for = xprop_transient_for(properties)
-    if transient_for == normalize_window_id(assignment.window_id):
-        return True
-
-    return bool(xprop_window_types(properties) & OWNED_POPUP_WINDOW_TYPES)
-
-
-def active_owned_modal_window(vm: VM, assignment: WindowTarget) -> WindowAssignment | None:
-    if not isinstance(assignment, WindowAssignment) or assignment.pid is None:
+def switch_pid_group_window(group: PidGroupAssignment, value: Any) -> WindowAssignment | None:
+    window = find_pid_group_window(group, value)
+    if window is None:
         return None
-    try:
-        active = vm.exec(f"{display_prefix(vm)} xdotool getactivewindow")
-        if isinstance(active, bytes):
-            active = active.decode("utf-8", errors="replace")
-        active_id = normalize_window_id(active)
-        expected_id = normalize_window_id(assignment.window_id)
-    except Exception:
-        return None
-
-    if active_id == expected_id:
-        return None
-
-    try:
-        windows = list_windows(vm)
-        active_window = find_window_info(windows, active_id)
-    except Exception:
-        return None
-    if active_window is None:
-        return None
-    if not active_window_is_owned_popup(vm, assignment, active_window):
-        return None
-    return window_assignment_from_info(active_window)
+    group.current_window = window_assignment_from_info(window)
+    return group.current_window
 
 
 def window_present(vm: VM, window_id: WindowTarget) -> bool:
@@ -888,6 +851,12 @@ def _number(action: Any, *keys: str, default: float = 0) -> float:
 def activate_window(vm: VM, window_id: WindowTarget) -> None:
     resolved = target_window_id(window_id)
     if not resolved:
+        if isinstance(window_id, PidGroupAssignment):
+            raise StaleWindowError(
+                f"pid:{window_id.pid}",
+                logical_id=window_id.logical_id,
+                reason="no current window selected",
+            )
         return
     quoted = shell_quote(resolved)
     try:
@@ -916,7 +885,7 @@ def ensure_target_window_is_active(vm: VM, window_id: WindowTarget) -> None:
             logical_id=target_logical_id(window_id),
             reason=f"active-window check failed: {error}",
         ) from error
-    if active_id != expected_id and active_owned_modal_window(vm, window_id) is None:
+    if active_id != expected_id:
         raise StaleWindowError(
             resolved,
             logical_id=target_logical_id(window_id),
@@ -965,10 +934,8 @@ def handle_computer_actions(
         button = _button_number(get_value(action, "button", "left"))
         keys = _action_keys(action)
 
-        activate_window(vm, window_id)
         action_window_id = window_id
-        if action_type in {"click", "double_click", "move", "scroll", "drag"}:
-            action_window_id = active_owned_modal_window(vm, window_id) or window_id
+        activate_window(vm, window_id)
         if action_type in {"type", "keypress"}:
             ensure_target_window_is_active(vm, window_id)
 
@@ -1027,8 +994,7 @@ def handle_computer_actions(
 
 
 def capture_screenshot(vm: VM, window_id: WindowTarget = None) -> bytes:
-    screenshot_window_id = active_owned_modal_window(vm, window_id) or window_id
-    resolved = target_window_id(screenshot_window_id)
+    resolved = target_window_id(window_id)
     target = shell_quote(resolved or "root")
     try:
         screenshot = vm.exec(
@@ -1039,12 +1005,13 @@ def capture_screenshot(vm: VM, window_id: WindowTarget = None) -> bytes:
         )
     except Exception as error:
         if resolved:
-            if not window_present(vm, screenshot_window_id):
-                return capture_screenshot(vm)
+            reason = f"screenshot failed: {error}"
+            if not window_present(vm, window_id):
+                reason = "window id is not present in registry"
             raise StaleWindowError(
                 resolved,
-                logical_id=target_logical_id(screenshot_window_id),
-                reason=f"screenshot failed: {error}",
+                logical_id=target_logical_id(window_id),
+                reason=reason,
             ) from error
         raise
     if not isinstance(screenshot, bytes):
@@ -1269,7 +1236,7 @@ class TrajectoryRecorder:
         label: str,
         windows: list[WindowInfo],
         *,
-        assignment: WindowAssignment | None = None,
+        assignment: WindowTarget = None,
     ) -> None:
         self.append_jsonl(
             self.window_snapshots_path,
@@ -1345,8 +1312,115 @@ def input_image(data: bytes) -> dict[str, Any]:
     }
 
 
+PID_GROUP_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "switch_window",
+        "description": "Switch the active computer-action target to a window in the assigned pid group.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "window": {
+                    "type": "string",
+                    "description": "Logical window id or X11 window id from the assigned pid group.",
+                },
+            },
+            "required": ["window"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "screenshot_windows",
+        "description": "Capture screenshots for one or more windows in the assigned pid group.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "windows": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": "Logical window ids or X11 window ids from the assigned pid group.",
+                },
+            },
+            "required": ["windows"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "refresh_pid_group",
+        "description": "Refresh the visible windows currently belonging to the assigned pid group.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+]
+
+
+def response_tools(window_id: WindowTarget) -> list[dict[str, Any]]:
+    tools: list[dict[str, Any]] = [{"type": "computer"}]
+    if isinstance(window_id, PidGroupAssignment):
+        tools.extend(PID_GROUP_TOOLS)
+    return tools
+
+
+def parse_function_arguments(call: Any) -> dict[str, Any]:
+    raw = get_value(call, "arguments", "{}")
+    if isinstance(raw, dict):
+        return raw
+    if raw is None:
+        return {}
+    try:
+        decoded = json.loads(str(raw))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid function call arguments: {raw!r}") from error
+    if not isinstance(decoded, dict):
+        raise ValueError("Function call arguments must be a JSON object.")
+    return decoded
+
+
+def tool_call_id(call: Any) -> str:
+    return str(get_value(call, "call_id") or get_value(call, "id") or get_value(call, "name") or "tool_call")
+
+
+def function_call_output(call: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "function_call_output",
+        "call_id": tool_call_id(call),
+        "output": json.dumps(payload, sort_keys=True),
+    }
+
+
+def text_input_message(text: str) -> dict[str, Any]:
+    return {"role": "user", "content": [{"type": "input_text", "text": text}]}
+
+
+def image_input_message(content: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"role": "user", "content": content}
+
+
 def format_window_registry(windows: Iterable[WindowInfo]) -> str:
     return json.dumps(to_plain(list(windows)), indent=2, sort_keys=True)
+
+
+def format_pid_groups(windows: Iterable[WindowInfo]) -> str:
+    groups = build_pid_groups(windows)
+    payload = [
+        {
+            "logical_id": group.logical_id,
+            "pid": group.pid,
+            "windows": group.windows,
+        }
+        for group in groups.values()
+    ]
+    return json.dumps(to_plain(payload), indent=2, sort_keys=True)
 
 
 def screenshot_artifact_bytes(
@@ -1394,6 +1468,7 @@ def build_planner_input(
         build_planner_prompt(progress),
         f"Available subagents for this stage: {subagent_capacity}",
         "Latest window registry:\n" + format_window_registry(windows),
+        "Latest pid groups:\n" + format_pid_groups(windows),
         "Latest screenshots:\n"
         + ("\n".join(screenshot_lines) if screenshot_lines else "No screenshots available."),
     ]
@@ -1474,6 +1549,279 @@ async def request_planner_plan(
     raise last_error
 
 
+def pid_group_payload(group: PidGroupAssignment) -> dict[str, Any]:
+    return {
+        "current_window": to_plain(group.current_window),
+        "logical_id": group.logical_id,
+        "pid": group.pid,
+        "windows": to_plain(group.windows),
+    }
+
+
+async def refresh_pid_group_async(
+    *,
+    vm: VM,
+    recorder: TrajectoryRecorder,
+    group: PidGroupAssignment,
+    logical_ids: WindowLogicalIdRegistry | None,
+    label: str,
+) -> dict[str, Any]:
+    windows = await asyncio.to_thread(list_windows, vm)
+    if logical_ids is not None:
+        windows = logical_ids.apply(windows)
+
+    group.windows = [window for window in windows if window.pid == group.pid]
+    if group.current_window is not None:
+        current = find_window_info(group.windows, group.current_window.window_id)
+        group.current_window = window_assignment_from_info(current) if current else None
+    recorder.record_window_snapshot(label, windows, assignment=group)
+    return pid_group_payload(group)
+
+
+async def recovery_computer_output(
+    *,
+    arbiter: InputArbiter,
+    recorder: TrajectoryRecorder,
+    call_id: Any,
+    turn: int,
+    group: PidGroupAssignment,
+) -> dict[str, Any]:
+    screenshot = await arbiter.screenshot(window_id=group)
+    recorder.record_screenshot(
+        f"{turn:03d}-recovery-after-call-{call_id or 'unknown'}",
+        screenshot,
+        call_id=call_id,
+        window_id=group,
+    )
+    return {
+        "type": "computer_call_output",
+        "call_id": call_id,
+        "output": screenshot_input(screenshot),
+    }
+
+
+async def handle_stale_pid_group_error(
+    *,
+    error: StaleWindowError,
+    vm: VM,
+    arbiter: InputArbiter,
+    recorder: TrajectoryRecorder,
+    call_id: Any,
+    turn: int,
+    group: PidGroupAssignment,
+    logical_ids: WindowLogicalIdRegistry | None,
+) -> list[dict[str, Any]]:
+    refreshed = await refresh_pid_group_async(
+        vm=vm,
+        recorder=recorder,
+        group=group,
+        logical_ids=logical_ids,
+        label=f"turn-{turn:03d}-stale-window-recovery",
+    )
+    payload = {
+        "error": str(error),
+        "message": (
+            "A selected window became stale. The pid group was refreshed. "
+            "If current_window is null, call switch_window before more mouse or keyboard actions."
+        ),
+        "pid_group": refreshed,
+    }
+    return [
+        await recovery_computer_output(
+            arbiter=arbiter,
+            recorder=recorder,
+            call_id=call_id,
+            turn=turn,
+            group=group,
+        ),
+        text_input_message("Window target recovery:\n" + json.dumps(payload, indent=2, sort_keys=True)),
+    ]
+
+
+async def handle_switch_window_tool(
+    *,
+    call: Any,
+    group: PidGroupAssignment,
+    arbiter: InputArbiter,
+    vm: VM,
+    recorder: TrajectoryRecorder,
+    logical_ids: WindowLogicalIdRegistry | None,
+) -> list[dict[str, Any]]:
+    arguments = parse_function_arguments(call)
+    requested = arguments.get("window")
+    selected = switch_pid_group_window(group, requested)
+    if selected is None:
+        payload = {
+            "status": "rejected",
+            "reason": "window is not in the assigned pid group",
+            "requested_window": requested,
+            "pid_group": pid_group_payload(group),
+        }
+        return [function_call_output(call, payload)]
+
+    try:
+        await arbiter.submit_action({"type": "wait", "ms": 0}, window_id=group)
+    except StaleWindowError as error:
+        refreshed = await refresh_pid_group_async(
+            vm=vm,
+            recorder=recorder,
+            group=group,
+            logical_ids=logical_ids,
+            label="switch-window-stale-recovery",
+        )
+        payload = {
+            "status": "stale",
+            "error": str(error),
+            "pid_group": refreshed,
+        }
+        return [function_call_output(call, payload)]
+
+    payload = {
+        "status": "switched",
+        "current_window": to_plain(group.current_window),
+        "pid_group": pid_group_payload(group),
+    }
+    return [function_call_output(call, payload)]
+
+
+async def handle_refresh_pid_group_tool(
+    *,
+    call: Any,
+    group: PidGroupAssignment,
+    vm: VM,
+    recorder: TrajectoryRecorder,
+    logical_ids: WindowLogicalIdRegistry | None,
+) -> list[dict[str, Any]]:
+    payload = await refresh_pid_group_async(
+        vm=vm,
+        recorder=recorder,
+        group=group,
+        logical_ids=logical_ids,
+        label="refresh-pid-group-tool",
+    )
+    return [function_call_output(call, {"status": "refreshed", "pid_group": payload})]
+
+
+async def handle_screenshot_windows_tool(
+    *,
+    call: Any,
+    group: PidGroupAssignment,
+    arbiter: InputArbiter,
+    recorder: TrajectoryRecorder,
+) -> list[dict[str, Any]]:
+    arguments = parse_function_arguments(call)
+    requested_windows = arguments.get("windows")
+    if not isinstance(requested_windows, list):
+        payload = {
+            "status": "rejected",
+            "reason": "windows must be a list",
+            "pid_group": pid_group_payload(group),
+        }
+        return [function_call_output(call, payload)]
+
+    results: list[dict[str, Any]] = []
+    image_content: list[dict[str, Any]] = []
+    for requested in requested_windows:
+        window = find_pid_group_window(group, requested)
+        if window is None:
+            results.append(
+                {
+                    "requested_window": requested,
+                    "reason": "window is not in the assigned pid group",
+                    "status": "rejected",
+                },
+            )
+            continue
+
+        assignment = window_assignment_from_info(window)
+        try:
+            screenshot = await arbiter.screenshot(window_id=assignment)
+        except Exception as error:
+            results.append(
+                {
+                    "logical_id": window.logical_id,
+                    "reason": str(error),
+                    "status": "failed",
+                    "window_id": window.window_id,
+                },
+            )
+            continue
+
+        path = recorder.record_screenshot(
+            f"screenshot-windows-{window.logical_id}",
+            screenshot,
+            call_id=tool_call_id(call),
+            window_id=assignment,
+        )
+        artifact_path = recorder.relative(path) if path is not None else None
+        results.append(
+            {
+                "logical_id": window.logical_id,
+                "path": artifact_path,
+                "status": "captured",
+                "window_id": window.window_id,
+            },
+        )
+        image_content.append(
+            {
+                "type": "input_text",
+                "text": f"Screenshot for {window.logical_id} ({window.window_id}): {artifact_path}",
+            },
+        )
+        image_content.append(input_image(screenshot))
+
+    output_items_for_tool = [
+        function_call_output(
+            call,
+            {
+                "pid_group": pid_group_payload(group),
+                "results": results,
+                "status": "completed",
+            },
+        ),
+    ]
+    if image_content:
+        output_items_for_tool.append(image_input_message(image_content))
+    return output_items_for_tool
+
+
+async def handle_pid_group_tool_call(
+    *,
+    call: Any,
+    group: PidGroupAssignment,
+    arbiter: InputArbiter,
+    vm: VM,
+    recorder: TrajectoryRecorder,
+    logical_ids: WindowLogicalIdRegistry | None,
+) -> list[dict[str, Any]]:
+    name = str(get_value(call, "name", ""))
+    if name == "switch_window":
+        return await handle_switch_window_tool(
+            call=call,
+            group=group,
+            arbiter=arbiter,
+            vm=vm,
+            recorder=recorder,
+            logical_ids=logical_ids,
+        )
+    if name == "screenshot_windows":
+        return await handle_screenshot_windows_tool(
+            call=call,
+            group=group,
+            arbiter=arbiter,
+            recorder=recorder,
+        )
+    if name == "refresh_pid_group":
+        return await handle_refresh_pid_group_tool(
+            call=call,
+            group=group,
+            vm=vm,
+            recorder=recorder,
+            logical_ids=logical_ids,
+        )
+    return [function_call_output(call, {"status": "rejected", "reason": f"Unsupported tool: {name}"})]
+
+
 async def computer_use_loop_async(
     *,
     client: Any,
@@ -1483,12 +1831,17 @@ async def computer_use_loop_async(
     arbiter: InputArbiter,
     window_id: WindowTarget = None,
     max_turns: int = DEFAULT_MAX_TURNS,
+    logical_ids: WindowLogicalIdRegistry | None = None,
 ) -> Any:
     current_response = response
 
     for turn in range(1, max_turns + 1):
         recorder.record_response(turn, current_response)
-        calls = computer_calls(current_response)
+        calls = [
+            item
+            for item in output_items(current_response)
+            if get_value(item, "type") in {"computer_call", "function_call"}
+        ]
 
         if not calls:
             final_response = extract_final_response(current_response)
@@ -1497,6 +1850,30 @@ async def computer_use_loop_async(
 
         tool_outputs: list[dict[str, Any]] = []
         for call in calls:
+            if get_value(call, "type") == "function_call":
+                if not isinstance(window_id, PidGroupAssignment):
+                    tool_outputs.append(
+                        function_call_output(
+                            call,
+                            {
+                                "status": "rejected",
+                                "reason": "pid-group tools require an assigned pid group",
+                            },
+                        ),
+                    )
+                    continue
+                tool_outputs.extend(
+                    await handle_pid_group_tool_call(
+                        call=call,
+                        group=window_id,
+                        arbiter=arbiter,
+                        vm=arbiter.vm,
+                        recorder=recorder,
+                        logical_ids=logical_ids,
+                    ),
+                )
+                continue
+
             pending_safety_checks = get_value(call, "pending_safety_checks", []) or []
             call_id = get_value(call, "call_id")
             recorder.record_computer_call(turn, call)
@@ -1508,6 +1885,7 @@ async def computer_use_loop_async(
 
             actions = list(get_value(call, "actions", []) or [])
             pending_screenshot_records: list[int] = []
+            stale_recovered = False
             for action_index, action in enumerate(actions):
                 record_id = recorder.record_action_decision(
                     action=action,
@@ -1517,6 +1895,37 @@ async def computer_use_loop_async(
                 )
                 try:
                     await arbiter.submit_action(action, window_id=window_id)
+                except StaleWindowError as error:
+                    recorder.mark_action_failed(record_id, error)
+                    for pending_record_id in pending_screenshot_records:
+                        recorder.mark_action_failed(pending_record_id, error)
+                    if isinstance(window_id, PidGroupAssignment):
+                        tool_outputs.extend(
+                            await handle_stale_pid_group_error(
+                                error=error,
+                                vm=arbiter.vm,
+                                arbiter=arbiter,
+                                recorder=recorder,
+                                call_id=call_id,
+                                turn=turn,
+                                group=window_id,
+                                logical_ids=logical_ids,
+                            ),
+                        )
+                        stale_recovered = True
+                        break
+                    if target_window_id(window_id) is not None:
+                        try:
+                            recorder.record_screenshot(
+                                f"{turn:03d}-failure-after-call-{call_id or 'unknown'}",
+                                await arbiter.screenshot(window_id=window_id),
+                                call_id=call_id,
+                                window_id=window_id,
+                            )
+                        except Exception:
+                            pass
+                    recorder.finish("failed", error=str(error))
+                    raise
                 except Exception as error:
                     recorder.mark_action_failed(record_id, error)
                     for pending_record_id in pending_screenshot_records:
@@ -1538,6 +1947,8 @@ async def computer_use_loop_async(
                 else:
                     recorder.mark_action_completed(record_id)
 
+            if stale_recovered:
+                continue
             if target_window_id(window_id) is None:
                 for record_id in pending_screenshot_records:
                     recorder.mark_action_completed(record_id)
@@ -1545,6 +1956,25 @@ async def computer_use_loop_async(
 
             try:
                 screenshot = await arbiter.screenshot(window_id=window_id)
+            except StaleWindowError as error:
+                for record_id in pending_screenshot_records:
+                    recorder.mark_action_failed(record_id, error)
+                if isinstance(window_id, PidGroupAssignment):
+                    tool_outputs.extend(
+                        await handle_stale_pid_group_error(
+                            error=error,
+                            vm=arbiter.vm,
+                            arbiter=arbiter,
+                            recorder=recorder,
+                            call_id=call_id,
+                            turn=turn,
+                            group=window_id,
+                            logical_ids=logical_ids,
+                        ),
+                    )
+                    continue
+                recorder.finish("failed", error=str(error))
+                raise
             except Exception as error:
                 for record_id in pending_screenshot_records:
                     recorder.mark_action_failed(record_id, error)
@@ -1570,7 +2000,7 @@ async def computer_use_loop_async(
             client.responses.create,
             model=model,
             previous_response_id=response_id(current_response),
-            tools=[{"type": "computer"}],
+            tools=response_tools(window_id),
             input=tool_outputs,
         )
 
@@ -1588,6 +2018,7 @@ def computer_use_loop(
     vm: VM,
     window_id: WindowTarget = None,
     max_turns: int = DEFAULT_MAX_TURNS,
+    logical_ids: WindowLogicalIdRegistry | None = None,
 ) -> Any:
     async def run() -> Any:
         async with InputArbiter(vm) as arbiter:
@@ -1599,6 +2030,7 @@ def computer_use_loop(
                 arbiter=arbiter,
                 window_id=window_id,
                 max_turns=max_turns,
+                logical_ids=logical_ids,
             )
 
     return asyncio.run(run())
@@ -1620,6 +2052,7 @@ async def run_computer_use_task_async(
     output_root: Path = Path(DEFAULT_OUTPUT_DIR),
     window_id: WindowTarget = None,
     arbiter: InputArbiter | None = None,
+    logical_ids: WindowLogicalIdRegistry | None = None,
 ) -> tuple[Any, TrajectoryRecorder]:
     recorder = TrajectoryRecorder(output_root, prompt=prompt, model=model, vm=vm)
     owns_arbiter = arbiter is None
@@ -1628,7 +2061,16 @@ async def run_computer_use_task_async(
     arbiter.start()
 
     try:
-        if isinstance(window_id, WindowAssignment):
+        if isinstance(window_id, PidGroupAssignment):
+            windows = await asyncio.to_thread(list_windows, vm)
+            if logical_ids is not None:
+                windows = logical_ids.apply(windows)
+            recorder.record_window_snapshot(
+                "stage-start",
+                windows,
+                assignment=window_id,
+            )
+        elif isinstance(window_id, WindowAssignment):
             windows = await asyncio.to_thread(list_windows, vm)
             recorder.record_window_snapshot(
                 "stage-start",
@@ -1637,16 +2079,27 @@ async def run_computer_use_task_async(
             )
             validate_window_assignment(vm, window_id, windows=windows)
         if target_window_id(window_id) is not None:
-            recorder.record_screenshot(
-                "000-initial",
-                await arbiter.screenshot(window_id=window_id),
-                call_id="initial",
-                window_id=window_id,
-            )
+            try:
+                recorder.record_screenshot(
+                    "000-initial",
+                    await arbiter.screenshot(window_id=window_id),
+                    call_id="initial",
+                    window_id=window_id,
+                )
+            except StaleWindowError:
+                if not isinstance(window_id, PidGroupAssignment):
+                    raise
+                await refresh_pid_group_async(
+                    vm=vm,
+                    recorder=recorder,
+                    group=window_id,
+                    logical_ids=logical_ids,
+                    label="stage-start-stale-window-recovery",
+                )
         first_response = await asyncio.to_thread(
             client.responses.create,
             model=model,
-            tools=[{"type": "computer"}],
+            tools=response_tools(window_id),
             input=prompt,
         )
         final_response = await computer_use_loop_async(
@@ -1657,6 +2110,7 @@ async def run_computer_use_task_async(
             arbiter=arbiter,
             window_id=window_id,
             max_turns=max_turns,
+            logical_ids=logical_ids,
         )
         return final_response, recorder
     except Exception as error:
@@ -1677,6 +2131,7 @@ def run_computer_use_task(
     max_turns: int = DEFAULT_MAX_TURNS,
     output_root: Path = Path(DEFAULT_OUTPUT_DIR),
     window_id: WindowTarget = None,
+    logical_ids: WindowLogicalIdRegistry | None = None,
 ) -> tuple[Any, TrajectoryRecorder]:
     return asyncio.run(
         run_computer_use_task_async(
@@ -1687,6 +2142,7 @@ def run_computer_use_task(
             max_turns=max_turns,
             output_root=output_root,
             window_id=window_id,
+            logical_ids=logical_ids,
         ),
     )
 
@@ -1742,20 +2198,19 @@ def open_planned_windows(
 def resolve_planner_assignments(
     plan: PlannerPlan,
     windows: Iterable[WindowInfo],
-) -> list[tuple[WindowAssignment, list[str]]]:
-    available = window_assignments_by_logical(windows)
-    resolved: list[tuple[WindowAssignment, list[str]]] = []
-    seen_window_ids: set[int] = set()
+) -> list[tuple[PidGroupAssignment, list[str]]]:
+    available = build_pid_groups(windows)
+    resolved: list[tuple[PidGroupAssignment, list[str]]] = []
+    seen_pids: set[int] = set()
 
     for assignment in plan.assignments:
-        window = available.get(assignment.window)
-        if window is None:
-            raise PlannerOutputError(f"Assignment references unknown window: {assignment.window}")
-        normalized = normalize_window_id(window.window_id)
-        if normalized in seen_window_ids:
-            raise PlannerOutputError(f"Multiple assignments resolved to window id: {window.window_id}")
-        seen_window_ids.add(normalized)
-        resolved.append((window, assignment.subtasks))
+        group = available.get(assignment.pid)
+        if group is None:
+            raise PlannerOutputError(f"Assignment references unknown pid: {assignment.pid}")
+        if assignment.pid in seen_pids:
+            raise PlannerOutputError(f"Duplicate assignment for pid: {assignment.pid}")
+        seen_pids.add(assignment.pid)
+        resolved.append((group, assignment.subtasks))
 
     return resolved
 
@@ -1764,15 +2219,25 @@ def format_subagent_prompt(
     *,
     original_prompt: str,
     stage: int,
-    window: WindowAssignment,
+    group: PidGroupAssignment,
     subtasks: list[str],
 ) -> str:
     lines = [
         "You are a computer-use subagent in a staged multi-window task.",
         f"Original user task: {original_prompt}",
         f"Stage: {stage}",
-        f"Assigned window: {window.logical_id} ({window.window_id})",
-        "Work only in this assigned window. Do not reason across windows.",
+        f"Assigned pid group: {group.logical_id} (pid {group.pid})",
+        "You may work only with windows in this assigned pid group.",
+        "Use switch_window before mouse or keyboard actions when the needed window is not current.",
+        "Use screenshot_windows to inspect one or more windows in the pid group.",
+        "Use refresh_pid_group when windows may have opened, closed, or changed.",
+        "Current selected window: "
+        + (
+            f"{group.current_window.logical_id} ({group.current_window.window_id})"
+            if group.current_window is not None
+            else "None"
+        ),
+        "Assigned pid windows:\n" + format_window_registry(group.windows),
         "Complete these subtasks in order:",
     ]
     lines.extend(f"{index}. {subtask}" for index, subtask in enumerate(subtasks, start=1))
@@ -1791,6 +2256,7 @@ def make_computer_use_subagent_pool(
     output_root: Path,
     arbiter: InputArbiter,
     count: int,
+    logical_ids: WindowLogicalIdRegistry | None = None,
 ) -> ComputerUseSubagentPool:
     if count < 1:
         raise ValueError("subagent count must be at least 1")
@@ -1805,6 +2271,7 @@ def make_computer_use_subagent_pool(
             output_root=output_root,
             window_id=window_id,
             arbiter=arbiter,
+            logical_ids=logical_ids,
         )
         final_text = extract_final_response(response)
         return StageResult(
@@ -1841,6 +2308,8 @@ async def run_orchestrated_computer_use_task_async(
         arbiter = InputArbiter(vm)
     arbiter.start()
 
+    logical_ids = WindowLogicalIdRegistry()
+
     if pool is None:
         pool = make_computer_use_subagent_pool(
             client=client,
@@ -1850,9 +2319,8 @@ async def run_orchestrated_computer_use_task_async(
             output_root=output_root,
             arbiter=arbiter,
             count=subagent_count,
+            logical_ids=logical_ids,
         )
-
-    logical_ids = WindowLogicalIdRegistry()
 
     try:
         windows = await refresh_window_registry(
@@ -1911,26 +2379,26 @@ async def run_orchestrated_computer_use_task_async(
                 continue
 
             subagent_invocations = []
-            for window, subtasks in assignments:
+            for group, subtasks in assignments:
                 subagent_prompt = format_subagent_prompt(
                     original_prompt=prompt,
                     stage=stage,
-                    window=window,
+                    group=group,
                     subtasks=subtasks,
                 )
                 if dump_prompts:
                     recorder.record_prompt_artifacts(
-                        call_id=f"subagent-stage-{stage:03d}-{window.logical_id}",
+                        call_id=f"subagent-stage-{stage:03d}-{group.logical_id}",
                         stage=stage,
                         actor="subagents",
                         prompt_text=subagent_prompt,
                     )
-                subagent_invocations.append(pool.invoke(window, subagent_prompt))
+                subagent_invocations.append(pool.invoke(group, subagent_prompt))
 
             results = await asyncio.gather(*subagent_invocations)
 
-            for (window, _subtasks), result in zip(assignments, results):
-                append_stage_result(progress, window, result)
+            for (group, _subtasks), result in zip(assignments, results):
+                append_stage_result(progress, group, result)
 
             windows = await refresh_window_registry(
                 vm=vm,
